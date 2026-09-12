@@ -61,6 +61,7 @@ CACHE_HORIZON_DAYS = 340   # observed live: seats.aero's cache ends 340-355 days
 
 IATA_RE = re.compile(r"^[A-Z]{3}$")
 MAX_AIRPORTS_PER_SIDE = 4  # e.g. "PEK,PKX" for Beijing or "LHR,LGW" for London
+MAX_RANGE_DAYS = 62        # --date/--end-date span; two months keeps trip lookups and refreshes within a day's quota
 DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 
 PROGRAM_NAMES = {
@@ -241,10 +242,10 @@ class SeatsAeroClient:
     def get(self, path: str, params: dict[str, Any] | None = None) -> dict[str, Any]:
         return self._request(path, params=params)
 
-    def post(self, path: str, body: dict[str, Any]) -> dict[str, Any]:
-        return self._request(path, body=body)
+    def post(self, path: str, body: dict[str, Any], *, counted: bool = True) -> dict[str, Any]:
+        return self._request(path, body=body, counted=counted)
 
-    def _request(self, path: str, params: dict[str, Any] | None = None, body: dict[str, Any] | None = None) -> dict[str, Any]:
+    def _request(self, path: str, params: dict[str, Any] | None = None, body: dict[str, Any] | None = None, *, counted: bool = True) -> dict[str, Any]:
         query = {k: _param_value(v) for k, v in (params or {}).items() if v is not None}
         url = f"{self._base_url}/{path.lstrip('/')}"
         if query:
@@ -257,7 +258,8 @@ class SeatsAeroClient:
         request = urllib.request.Request(url, data=data, headers=headers, method="POST" if body is not None else "GET")
         for attempt in range(self._max_retries + 1):
             try:
-                self.calls_made += 1
+                if counted:
+                    self.calls_made += 1
                 with self._opener(request, self._timeout) as response:
                     return json.loads(response.read().decode("utf-8"))
             except urllib.error.HTTPError as err:
@@ -313,7 +315,7 @@ class SeatsAeroClient:
         """Flight-level detail (segments, taxes, booking links) for one Availability."""
         return self.get(f"trips/{urllib.parse.quote(availability_id, safe='')}")
 
-    def refresh(self, availability_ids: Sequence[str]) -> dict[str, Any]:
+    def refresh(self, availability_ids: Sequence[str], *, poll: bool = False) -> dict[str, Any]:
         """Queue (or poll) a re-scrape of up to 250 Availability objects. Pro keys only.
 
         The same call both queues and polls: re-posting IDs that are already processing
@@ -322,8 +324,9 @@ class SeatsAeroClient:
            "counts":{"processing","succeeded","failed"}, "complete": bool,
            "quota":{"limit","used","remaining","reset_seconds"}}
         Statuses seen: queued, processing, succeeded, failed, skipped_outage.
+        Polls (poll=True) are free on the seats.aero side, so they are left out of calls_made.
         """
-        return self.post("refresh", {"availability_ids": list(availability_ids)})
+        return self.post("refresh", {"availability_ids": list(availability_ids)}, counted=not poll)
 
     def refresh_and_wait(
         self,
@@ -350,7 +353,7 @@ class SeatsAeroClient:
             waited += poll_seconds
             still_pending = []
             for batch in pending:
-                response = self.refresh(batch)
+                response = self.refresh(batch, poll=True)
                 outcome.absorb(response)
                 if not response.get("complete"):
                     still_pending.append(batch)
@@ -407,7 +410,7 @@ class RefreshOutcome:
             outage = self.count("skipped_outage")
             parts.append(f"{self.skipped} skipped" + (f" ({outage} because seats.aero has that program's scraping paused)" if outage else ""))
         if self.failed:
-            parts.append(f"{self.failed} failed")
+            parts.append(f"{self.failed} failed on seats.aero's side (cached figures shown for those)")
         if self.processing:
             parts.append(f"{self.processing} still processing when the wait timed out (seats.aero finishes in the background; re-run in a few minutes for the updated figures)")
         text = f"Refreshed before reporting ({self.requested} record{'s' if self.requested != 1 else ''}): " + ", ".join(parts) + "."
@@ -492,7 +495,7 @@ class SearchQuery:
     direct_only: bool = False
     sources: tuple[str, ...] = ()
     max_trip_lookups: int = DEFAULT_TRIP_LOOKUPS
-    date_mode: str = "exact"           # exact | flex | schedule-opening
+    date_mode: str = "exact"           # exact | flex | range | schedule-opening
     refresh: bool = True
     refresh_older_than_hours: float = DEFAULT_REFRESH_OLDER_THAN_HOURS
     refresh_timeout_seconds: float = DEFAULT_REFRESH_TIMEOUT_SECONDS
@@ -995,7 +998,7 @@ def table_columns(q: SearchQuery) -> list[Column]:
 
 def _next_steps_hint(q: SearchQuery) -> str:
     hints = []
-    if q.date_mode != "flex":
+    if q.date_mode not in ("flex", "range"):
         hints.append("`--flex 3` for nearby dates")
     hints.append("a nearby hub or alternate airport")
     if q.pax > 1:
@@ -1226,7 +1229,8 @@ def parse_args(argv: Sequence[str] | None = None, today: date | None = None) -> 
     parser.add_argument("destination", help="Destination airport IATA code(s), e.g. PEK,PKX")
     parser.add_argument("--date", default=None, help=f"Departure date, YYYY-MM-DD. Omit to scan {SCHEDULE_OPENING_DAYS[0]}-{SCHEDULE_OPENING_DAYS[1]} days out (schedule opening)")
     parser.add_argument("--pax", type=int, default=1, help="Number of passengers (1-9). Default 1")
-    parser.add_argument("--flex", type=int, default=0, metavar="DAYS", help="Also search +/- DAYS around --date (0-7)")
+    parser.add_argument("--end-date", default=None, metavar="DATE", help=f"Search every day from --date to this date inclusive (up to {MAX_RANGE_DAYS} days), e.g. a whole month")
+    parser.add_argument("--flex", type=int, default=0, metavar="DAYS", help="Also search +/- DAYS around --date (0-7). Not combined with --end-date")
     parser.add_argument("--cabins", default=",".join(DEFAULT_CABINS), help="Comma list from: business,first. Default both")
     parser.add_argument("--direct-only", action="store_true", help="Only nonstop itineraries")
     parser.add_argument("--sources", default="", help="Comma list of seats.aero program codes to restrict to (e.g. aeroplan,united)")
@@ -1251,8 +1255,8 @@ def parse_args(argv: Sequence[str] | None = None, today: date | None = None) -> 
     if not 0 <= args.flex <= 7:
         raise UsageError("--flex must be between 0 and 7 days")
     if args.date is None:
-        if args.flex:
-            raise UsageError("--flex needs a --date to be flexible around")
+        if args.flex or args.end_date:
+            raise UsageError("--flex and --end-date need a --date to work from")
         start_date = today + timedelta(days=SCHEDULE_OPENING_DAYS[0])
         end_date = today + timedelta(days=SCHEDULE_OPENING_DAYS[1])
         date_mode = "schedule-opening"
@@ -1265,9 +1269,24 @@ def parse_args(argv: Sequence[str] | None = None, today: date | None = None) -> 
             raise UsageError(f"--date is not a real calendar date: {err}") from None
         if travel_date < today:
             raise UsageError(f"--date {travel_date} is in the past (today is {today})")
-        start_date = travel_date - timedelta(days=args.flex)
-        end_date = travel_date + timedelta(days=args.flex)
-        date_mode = "flex" if args.flex else "exact"
+        if args.end_date:
+            if args.flex:
+                raise UsageError("use either --flex or --end-date, not both")
+            if not DATE_RE.match(args.end_date):
+                raise UsageError("--end-date must be YYYY-MM-DD")
+            try:
+                end_date = date.fromisoformat(args.end_date)
+            except ValueError as err:
+                raise UsageError(f"--end-date is not a real calendar date: {err}") from None
+            if end_date < travel_date:
+                raise UsageError("--end-date must not be before --date")
+            if (end_date - travel_date).days + 1 > MAX_RANGE_DAYS:
+                raise UsageError(f"--date to --end-date spans more than {MAX_RANGE_DAYS} days; split it into shorter runs")
+            start_date, date_mode = travel_date, "range"
+        else:
+            start_date = travel_date - timedelta(days=args.flex)
+            end_date = travel_date + timedelta(days=args.flex)
+            date_mode = "flex" if args.flex else "exact"
     if not 1 <= args.pax <= 9:
         raise UsageError("--pax must be between 1 and 9")
     if args.refresh_older_than < 0 or args.refresh_timeout < 0:

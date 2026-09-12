@@ -19,7 +19,7 @@ result so the user can act on it.
 | Destination airport | yes | Same rules. |
 | Date flying | no | `YYYY-MM-DD`. If the user gives "14 Nov", assume the next occurrence and confirm the year in your reply. **If the user gives no date at all, omit `--date`**: the script scans 354–355 days out, the schedule-opening window where airlines first release award seats. Say that is what you did. |
 | Passengers | yes | 1–9. Default to 1 only if the user clearly means themselves alone. |
-| Flexibility | optional | `--flex N` searches ±N days. Offer it when a date returns nothing. |
+| Flexibility | optional | `--flex N` searches ±N days (max 7). Offer it when a date returns nothing. For a whole month or any span up to 62 days use `--date FIRST --end-date LAST` instead. |
 | Cabin | optional | Default is business **and** first. Use `--cabins first` when the user only wants first. Economy and premium economy are out of scope; the script refuses them. |
 | Nonstop only | optional | `--direct-only`. |
 | Fresh data | default on | Every search first asks seats.aero to re-scrape the matching business/first records (oldest first, up to 100) and waits up to 120s, so the report reflects what the programs show now. Each refreshed record spends one call of the 1,000/day quota; a typical search spends 5–30. Pass `--no-refresh` only when the user explicitly wants a quick cached look or is short on quota. `--refresh-older-than HOURS` narrows the refresh to older records. |
@@ -45,6 +45,7 @@ python3 scripts/search_awards.py JFK NRT --date 2027-03-02 --pax 1 --cabins firs
 python3 scripts/search_awards.py SIN PEK,PKX --date 2027-09-02 --pax 2          # both Beijing airports
 python3 scripts/search_awards.py LAX SYD --date 2026-12-20 --pax 2 --flex 3 --direct-only
 python3 scripts/search_awards.py SFO CDG --date 2026-10-05 --pax 3 --json   # machine-readable
+python3 scripts/search_awards.py SIN NRT,HND --date 2026-12-01 --end-date 2026-12-31 --pax 2   # whole month
 python3 scripts/search_awards.py SIN NGO --pax 2                             # no date: 354-355 days out
 python3 scripts/search_awards.py SIN PEK,PKX --date 2026-11-14 --pax 2 --no-refresh   # cached data only, saves quota
 ```

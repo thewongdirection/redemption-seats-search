@@ -33,6 +33,7 @@ own Claude account, for both Claude Code on your computer and Claude Code on the
 | Travel date | `YYYY-MM-DD`, today or later | `2026-11-14` | no. Omit it to scan 354–355 days out, the window where airlines first release award seats |
 | Passengers | 1–9 | `--pax 2` | no, defaults to 1 |
 | Date flexibility | 0–7 days either side | `--flex 3` | no, defaults to exact date |
+| Date range | last day of a span up to 62 days | `--end-date 2026-12-31` | no; use instead of `--flex` for a whole month |
 | Cabins | `business`, `first`, or both | `--cabins first` | no, defaults to both |
 | Nonstop only | flag | `--direct-only` | no |
 | Programs | seats.aero program codes | `--sources aeroplan,united` | no, defaults to all |
@@ -103,6 +104,7 @@ python3 scripts/search_awards.py SIN LHR --date 2026-11-14 --pax 2
 python3 scripts/search_awards.py SIN PEK,PKX --date 2027-09-02 --pax 2     # multiple airports per side
 python3 scripts/search_awards.py JFK NRT --date 2027-03-02 --cabins first --flex 3
 python3 scripts/search_awards.py LAX SYD --date 2026-12-20 --pax 2 --direct-only --json
+python3 scripts/search_awards.py SIN NRT,HND --date 2026-12-01 --end-date 2026-12-31 --pax 2  # whole month
 python3 scripts/search_awards.py SIN NGO --pax 2                              # no date: 354-355 days out
 python3 scripts/search_awards.py SIN PEK,PKX --date 2026-11-14 --pax 2 --no-refresh   # cached data only, saves quota
 ```
@@ -146,7 +148,7 @@ drive a seats.aero MCP server.
 ## Development
 
 ```bash
-./run_tests.sh              # 78 offline unit tests, network mocked
+./run_tests.sh              # 80 offline unit tests, network mocked
 ./scripts/check_secrets.sh  # credential scan
 ```
 

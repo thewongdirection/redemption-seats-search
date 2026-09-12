@@ -243,6 +243,7 @@ class RefreshTests(unittest.TestCase):
         self.assertEqual(outcome.succeeded, 2)
         self.assertFalse(outcome.timed_out)
         self.assertEqual(sleeps, [5, 5])
+        self.assertEqual(client.calls_made, 1, "polls are free and must not inflate the call count")
         self.assertEqual(outcome.quota["remaining"], 850)
         self.assertIn("2 refreshed", outcome.summary())
         self.assertIn("850/1000", outcome.summary())
@@ -481,6 +482,19 @@ class ArgumentValidationTests(unittest.TestCase):
         self.assertEqual(q.date_mode, "schedule-opening")
         self.assertEqual(q.window_label, "2027-09-01 to 2027-09-02")
         self.assertEqual(sa.default_report_path(q).name, "awards_SIN-LHR_2027-09-01_to_2027-09-02_pax2.html")
+
+    def test_end_date_gives_a_range(self):
+        q, _ = self.parse("SIN", "NRT,HND", "--date", "2026-12-01", "--end-date", "2026-12-31", "--pax", "2")
+        self.assertEqual((q.start_date, q.end_date, q.date_mode), (date(2026, 12, 1), date(2026, 12, 31), "range"))
+        self.assertEqual(sa.default_report_path(q).name, "awards_SIN-NRT+HND_2026-12-01_to_2026-12-31_pax2.html")
+        self.assertNotIn("--flex", sa._next_steps_hint(q))
+
+    def test_end_date_validation(self):
+        for extra in (["--end-date", "2026-11-30"], ["--end-date", "2027-02-15"], ["--end-date", "12/31/2026"], ["--end-date", "2026-12-31", "--flex", "2"]):
+            with self.assertRaises(sa.UsageError, msg=extra):
+                self.parse("SIN", "LHR", "--date", "2026-12-01", *extra)
+        with self.assertRaises(sa.UsageError):
+            self.parse("SIN", "LHR", "--end-date", "2026-12-31")
 
     def test_flex_without_date_is_rejected(self):
         with self.assertRaises(sa.UsageError):
