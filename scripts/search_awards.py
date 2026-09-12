@@ -96,6 +96,8 @@ AIRLINE_NAMES = {
     "TG": "Thai Airways", "TK": "Turkish Airlines", "TP": "TAP Air Portugal",
     "UA": "United", "UL": "SriLankan", "VA": "Virgin Australia", "VN": "Vietnam Airlines",
     "VS": "Virgin Atlantic", "WY": "Oman Air",
+    "ZH": "Shenzhen Airlines", "MU": "China Eastern", "CZ": "China Southern", "HU": "Hainan Airlines",
+    "3U": "Sichuan Airlines", "MF": "Xiamen Air", "HO": "Juneyao Air", "SC": "Shandong Airlines",
 }
 
 DEFAULT_REPORT_DIR = Path("award-reports")
@@ -152,6 +154,9 @@ AIRLINE_URLS = {
     "TK": "https://www.turkishairlines.com/", "TP": "https://www.flytap.com/", "UA": "https://www.united.com/",
     "UL": "https://www.srilankan.com/", "VA": "https://www.virginaustralia.com/", "VN": "https://www.vietnamairlines.com/",
     "VS": "https://www.virginatlantic.com/", "WY": "https://www.omanair.com/",
+    "ZH": "https://www.shenzhenair.com/", "MU": "https://www.ceair.com/", "CZ": "https://www.csair.com/",
+    "HU": "https://www.hainanairlines.com/", "3U": "https://www.sichuanair.com/", "MF": "https://www.xiamenair.com/",
+    "HO": "https://www.juneyaoair.com/", "SC": "https://www.sda.cn/",
 }
 
 
