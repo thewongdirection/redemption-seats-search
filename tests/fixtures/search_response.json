@@ -1,0 +1,53 @@
+{
+  "data": [
+    {
+      "ID": "avail-aeroplan-1",
+      "RouteID": "route-1",
+      "Route": {"ID": "route-1", "OriginAirport": "SIN", "OriginRegion": "Asia", "DestinationAirport": "LHR", "DestinationRegion": "Europe", "NumDaysOut": 60, "Distance": 6765, "Source": "aeroplan"},
+      "Date": "2026-11-14",
+      "ParsedDate": "2026-11-14T00:00:00Z",
+      "YAvailable": true, "WAvailable": false, "JAvailable": true, "FAvailable": false,
+      "YMileageCost": "45000", "WMileageCost": "0", "JMileageCost": "87500", "FMileageCost": "0",
+      "YMileageCostRaw": 45000, "WMileageCostRaw": 0, "JMileageCostRaw": 87500, "FMileageCostRaw": 0,
+      "TaxesCurrency": "CAD",
+      "YTotalTaxes": 12000, "WTotalTaxes": 0, "JTotalTaxes": 14750, "FTotalTaxes": 0,
+      "YRemainingSeats": 4, "WRemainingSeats": 0, "JRemainingSeats": 2, "FRemainingSeats": 0,
+      "YAirlines": "SQ, LH", "WAirlines": "", "JAirlines": "SQ", "FAirlines": "",
+      "YDirect": true, "JDirect": true,
+      "Source": "aeroplan",
+      "CreatedAt": "2026-09-01T10:00:00Z",
+      "UpdatedAt": "2099-01-01T00:00:00Z"
+    },
+    {
+      "ID": "avail-united-economy-only",
+      "RouteID": "route-2",
+      "Route": {"ID": "route-2", "OriginAirport": "SIN", "OriginRegion": "Asia", "DestinationAirport": "LHR", "DestinationRegion": "Europe", "NumDaysOut": 60, "Distance": 6765, "Source": "united"},
+      "Date": "2026-11-14",
+      "YAvailable": true, "WAvailable": true, "JAvailable": false, "FAvailable": false,
+      "YMileageCostRaw": 40000, "WMileageCostRaw": 60000, "JMileageCostRaw": 0, "FMileageCostRaw": 0,
+      "TaxesCurrency": "USD",
+      "YRemainingSeats": 9, "WRemainingSeats": 2, "JRemainingSeats": 0, "FRemainingSeats": 0,
+      "YAirlines": "UA", "WAirlines": "UA", "JAirlines": "", "FAirlines": "",
+      "Source": "united",
+      "UpdatedAt": "2099-01-01T00:00:00Z"
+    },
+    {
+      "ID": "avail-qantas-first",
+      "RouteID": "route-3",
+      "Route": {"ID": "route-3", "OriginAirport": "SIN", "OriginRegion": "Asia", "DestinationAirport": "LHR", "DestinationRegion": "Europe", "NumDaysOut": 60, "Distance": 6765, "Source": "qantas"},
+      "Date": "2026-11-14",
+      "YAvailable": false, "WAvailable": false, "JAvailable": true, "FAvailable": true,
+      "JMileageCost": "108400", "FMileageCost": "162800",
+      "JMileageCostRaw": 108400, "FMileageCostRaw": 162800,
+      "TaxesCurrency": "AUD",
+      "JTotalTaxes": 52000, "FTotalTaxes": 52000,
+      "JRemainingSeats": 0, "FRemainingSeats": 0,
+      "JAirlines": "QF, BA", "FAirlines": "QF",
+      "Source": "qantas",
+      "UpdatedAt": "2020-01-01T00:00:00Z"
+    }
+  ],
+  "count": 3,
+  "hasMore": false,
+  "cursor": 0
+}

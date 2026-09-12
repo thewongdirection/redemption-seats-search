@@ -1,0 +1,46 @@
+{
+  "data": [
+    {
+      "ID": "trip-qantas-first",
+      "AvailabilityID": "avail-qantas-first",
+      "AvailabilitySegments": [
+        {"ID": "seg-q1", "FlightNumber": "QF1", "AircraftName": "Airbus A380-800", "OriginAirport": "SIN", "DestinationAirport": "LHR", "DepartsAt": "2026-11-14T23:30:00Z", "ArrivesAt": "2026-11-15T06:15:00Z", "Cabin": "first", "Order": 0}
+      ],
+      "TotalDuration": 885,
+      "Stops": 0,
+      "Carriers": "QF",
+      "RemainingSeats": 0,
+      "MileageCost": 162800,
+      "TotalTaxes": 52000,
+      "TaxesCurrency": "AUD",
+      "FlightNumbers": "QF1",
+      "DepartsAt": "2026-11-14T23:30:00Z",
+      "ArrivesAt": "2026-11-15T06:15:00Z",
+      "Cabin": "first",
+      "Source": "qantas",
+      "UpdatedAt": "2020-01-01T00:00:00Z",
+      "Filtered": false
+    },
+    {
+      "ID": "trip-qantas-business",
+      "AvailabilityID": "avail-qantas-first",
+      "AvailabilitySegments": [],
+      "TotalDuration": 885,
+      "Stops": 0,
+      "Carriers": "QF",
+      "RemainingSeats": 0,
+      "MileageCost": 108400,
+      "TotalTaxes": 52000,
+      "TaxesCurrency": "AUD",
+      "FlightNumbers": "QF1",
+      "DepartsAt": "2026-11-14T23:30:00Z",
+      "ArrivesAt": "2026-11-15T06:15:00Z",
+      "Cabin": "business",
+      "Source": "qantas",
+      "UpdatedAt": "2020-01-01T00:00:00Z",
+      "Filtered": false
+    }
+  ],
+  "booking_links": [],
+  "revalidation_id": "rev-2"
+}

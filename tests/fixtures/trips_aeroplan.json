@@ -1,0 +1,75 @@
+{
+  "data": [
+    {
+      "ID": "trip-aeroplan-direct",
+      "RouteID": "route-1",
+      "AvailabilityID": "avail-aeroplan-1",
+      "AvailabilitySegments": [
+        {"ID": "seg-1", "FlightNumber": "SQ308", "Distance": 6765, "FareClass": "I", "AircraftName": "Airbus A380-800", "AircraftCode": "388", "OriginAirport": "SIN", "DestinationAirport": "LHR", "DepartsAt": "2026-11-14T09:00:00Z", "ArrivesAt": "2026-11-14T15:30:00Z", "Cabin": "business", "Order": 0}
+      ],
+      "TotalDuration": 870,
+      "Stops": 0,
+      "Carriers": "SQ",
+      "RemainingSeats": 2,
+      "MileageCost": 87500,
+      "TotalTaxes": 14750,
+      "TaxesCurrency": "CAD",
+      "TaxesCurrencySymbol": "$",
+      "FlightNumbers": "SQ308",
+      "DepartsAt": "2026-11-14T09:00:00Z",
+      "ArrivesAt": "2026-11-14T15:30:00Z",
+      "Cabin": "business",
+      "Source": "aeroplan",
+      "UpdatedAt": "2099-01-01T00:00:00Z",
+      "Filtered": false
+    },
+    {
+      "ID": "trip-aeroplan-onestop",
+      "RouteID": "route-1",
+      "AvailabilityID": "avail-aeroplan-1",
+      "AvailabilitySegments": [
+        {"ID": "seg-2", "FlightNumber": "LH779", "AircraftName": "Airbus A350-900", "OriginAirport": "SIN", "DestinationAirport": "FRA", "DepartsAt": "2026-11-14T23:55:00Z", "ArrivesAt": "2026-11-15T06:05:00Z", "Cabin": "business", "Order": 0},
+        {"ID": "seg-3", "FlightNumber": "LH900", "AircraftName": "Airbus A320neo", "OriginAirport": "FRA", "DestinationAirport": "LHR", "DepartsAt": "2026-11-15T08:00:00Z", "ArrivesAt": "2026-11-15T08:45:00Z", "Cabin": "business", "Order": 1}
+      ],
+      "TotalDuration": 950,
+      "Stops": 1,
+      "Carriers": "LH",
+      "RemainingSeats": 1,
+      "MileageCost": 87500,
+      "TotalTaxes": 39900,
+      "TaxesCurrency": "CAD",
+      "FlightNumbers": "LH779, LH900",
+      "DepartsAt": "2026-11-14T23:55:00Z",
+      "ArrivesAt": "2026-11-15T08:45:00Z",
+      "Cabin": "business",
+      "Source": "aeroplan",
+      "UpdatedAt": "2099-01-01T00:00:00Z",
+      "Filtered": false
+    },
+    {
+      "ID": "trip-aeroplan-economy",
+      "AvailabilityID": "avail-aeroplan-1",
+      "AvailabilitySegments": [],
+      "TotalDuration": 870, "Stops": 0, "Carriers": "SQ", "RemainingSeats": 4,
+      "MileageCost": 45000, "TotalTaxes": 12000, "TaxesCurrency": "CAD",
+      "FlightNumbers": "SQ308", "DepartsAt": "2026-11-14T09:00:00Z", "ArrivesAt": "2026-11-14T15:30:00Z",
+      "Cabin": "economy", "Source": "aeroplan", "Filtered": false
+    },
+    {
+      "ID": "trip-aeroplan-filtered",
+      "AvailabilityID": "avail-aeroplan-1",
+      "AvailabilitySegments": [],
+      "TotalDuration": 870, "Stops": 0, "Carriers": "SQ", "RemainingSeats": 2,
+      "MileageCost": 250000, "TotalTaxes": 14750, "TaxesCurrency": "CAD",
+      "FlightNumbers": "SQ322", "DepartsAt": "2026-11-14T22:00:00Z", "ArrivesAt": "2026-11-15T04:30:00Z",
+      "Cabin": "business", "Source": "aeroplan", "Filtered": true
+    }
+  ],
+  "origin_coordinates": {"Lat": 1.35, "Lon": 103.99},
+  "destination_coordinates": {"Lat": 51.47, "Lon": -0.45},
+  "booking_links": [
+    {"label": "Book on Aeroplan", "link": "https://www.aircanada.com/aeroplan/redeem/availability/outbound?org0=SIN&dest0=LHR&departureDate0=2026-11-14", "primary": true},
+    {"label": "seats.aero", "link": "https://seats.aero/search?origin=SIN", "primary": false}
+  ],
+  "revalidation_id": "rev-1"
+}

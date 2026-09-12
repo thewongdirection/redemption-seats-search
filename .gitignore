@@ -1,0 +1,25 @@
+# Secrets - never commit API keys
+.env
+.env.*
+*.key
+api_key
+secrets/
+
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+venv/
+
+# Local scratch / raw API dumps (may contain account-specific data)
+*.raw.json
+scratch/
+
+# OS / editor
+.DS_Store
+.idea/
+.vscode/
+
+# Generated reports (personal travel data)
+award-reports/
