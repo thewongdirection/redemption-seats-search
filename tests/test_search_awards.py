@@ -701,9 +701,20 @@ class CrossCheckParsingTests(unittest.TestCase):
         self.assertEqual(cc.parse_text("{not json"), [])
 
     def test_load_files_walks_directories(self):
-        entries, files = cc.load_files([FIXTURES])
+        entries, files, empty = cc.load_files([FIXTURES])
         self.assertGreaterEqual(files, 3)
         self.assertGreaterEqual(len(entries), 9)
+        self.assertEqual(empty, 0)
+
+    def test_explicit_empty_results_are_counted_separately(self):
+        tmp = Path(tempfile.mkdtemp())
+        (tmp / "a.txt").write_text("Award Flight Search: SIN → HKG\nDate: 2026-11-06  |  Cabin: Business  |  Passengers: 2\n\nSearch complete. Found 0 award flight option(s).\n\nNo flights found matching your criteria.\n")
+        (tmp / "b.txt").write_text("No detailed flight information found.\n")
+        (tmp / "c.txt").write_text("Error: FlightPoints API 400 for /search/key/\n")
+        entries, files, empty = cc.load_files([tmp])
+        self.assertEqual((len(entries), files, empty), (0, 3, 2))
+        self.assertTrue(cc.is_empty_result("Search complete. Found 0 award flight option(s)."))
+        self.assertFalse(cc.is_empty_result("Error: FlightPoints API 400"))
 
 
 class CrossCheckMatchingTests(unittest.TestCase):
@@ -800,12 +811,25 @@ class CrossCheckRenderingTests(unittest.TestCase):
         self.assertIn("✓ 2 sources", html)
         self.assertIn("✓ seats.aero + FlightPoints", sa.render_markdown(result))
 
-    def test_empty_cross_check_files_add_a_note_not_a_crash(self):
+    def test_unreadable_cross_check_files_add_a_note_not_a_crash(self):
         client, _, _ = make_client(default_routes())
         result = sa.run_search(client, query())
-        empty = Path(tempfile.mkdtemp()) / "empty.txt"; empty.write_text("Error: FlightPoints API 400")
-        sa.apply_cross_check(result, [empty])
-        self.assertTrue(any("no FlightPoints entries" in n for n in result.notes))
+        broken = Path(tempfile.mkdtemp()) / "broken.txt"; broken.write_text("Error: FlightPoints API 400")
+        sa.apply_cross_check(result, [broken])
+        self.assertTrue(any("no FlightPoints entries could be read" in n for n in result.notes))
+        self.assertFalse(result.crosscheck.answered)
+
+    def test_flightpoints_finding_nothing_is_reported_as_a_real_answer(self):
+        client, _, _ = make_client(default_routes())
+        result = sa.run_search(client, query())
+        tmp = Path(tempfile.mkdtemp())
+        (tmp / "none.txt").write_text("Award Flight Search: SIN → LHR\nDate: 2026-11-14  |  Cabin: Business  |  Passengers: 1\n\nSearch complete. Found 0 award flight option(s).\n\nNo flights found matching your criteria.\n")
+        sa.apply_cross_check(result, [tmp])
+        self.assertTrue(result.crosscheck.answered)
+        note = next(n for n in result.notes if "FlightPoints" in n)
+        self.assertIn("reported no business or first space", note)
+        self.assertNotIn("could be read", note)
+        self.assertEqual(json.loads(sa.render_json(result))["crosscheck"]["empty_files"], 1)
 
 
 class LoadPreviousRunTests(unittest.TestCase):

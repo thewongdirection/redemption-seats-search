@@ -67,18 +67,34 @@ class CrossCheckEntry:
         return bool(self.flight_numbers)
 
 
+# FlightPoints says so explicitly when a query succeeded but found nothing; that is a real
+# "the other source looked and saw no premium space" answer, not an unreadable file.
+EMPTY_MARKERS = ("Found 0 award flight option", "No flights found matching your criteria",
+                 "No detailed flight information found")
+
+
+def is_empty_result(text: str) -> bool:
+    return any(marker in text for marker in EMPTY_MARKERS)
+
+
 @dataclass
 class CrossCheckSummary:
     entries: int = 0
     files: int = 0
+    empty_files: int = 0     # queries FlightPoints answered with no availability
     flight_matches: int = 0
     program_matches: int = 0
     price_disagreements: list[str] = field(default_factory=list)
     unmatched: list[str] = field(default_factory=list)   # FlightPoints entries seats.aero did not have
 
+    @property
+    def answered(self) -> bool:
+        """True when FlightPoints responded to every file we read, whether or not it found anything."""
+        return self.files > 0 and (self.entries > 0 or self.empty_files == self.files)
+
     def to_json(self) -> dict[str, Any]:
         return {
-            "provider": "flightpoints", "files": self.files, "entries": self.entries,
+            "provider": "flightpoints", "files": self.files, "entries": self.entries, "empty_files": self.empty_files,
             "flight_matches": self.flight_matches, "program_matches": self.program_matches,
             "price_disagreements": self.price_disagreements, "unmatched": self.unmatched,
         }
@@ -208,19 +224,25 @@ def parse_text(text: str) -> list[CrossCheckEntry]:
     return []
 
 
-def load_files(paths: Sequence[Path]) -> tuple[list[CrossCheckEntry], int]:
+def load_files(paths: Sequence[Path]) -> tuple[list[CrossCheckEntry], int, int]:
+    """Returns (entries, files read, files that were an explicit empty result)."""
     entries: list[CrossCheckEntry] = []
-    files = 0
+    files = empty = 0
     for path in paths:
         if path.is_dir():
             sub = sorted(p for p in path.iterdir() if p.is_file())
-            more, n = load_files(sub)
+            more, n, e = load_files(sub)
             entries += more
             files += n
+            empty += e
             continue
         files += 1
-        entries += parse_text(path.read_text(encoding="utf-8", errors="replace"))
-    return entries, files
+        text = path.read_text(encoding="utf-8", errors="replace")
+        found = parse_text(text)
+        entries += found
+        if not found and is_empty_result(text):
+            empty += 1
+    return entries, files, empty
 
 
 # --------------------------------------------------------------------------- matching

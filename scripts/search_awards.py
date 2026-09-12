@@ -925,15 +925,20 @@ def sort_options(options: list[AwardOption]) -> None:
 
 def apply_cross_check(result: SearchResult, paths: Sequence[Path], log: Callable[[str], None] = lambda _: None) -> None:
     """Match FlightPoints output files against the seats.aero rows and regroup the report."""
-    entries, files = crosscheck.load_files(list(paths))
+    entries, files, empty_files = crosscheck.load_files(list(paths))
     summary = crosscheck.match_options(result.options, entries)
     summary.files = files
+    summary.empty_files = empty_files
     result.crosscheck = summary
     sort_options(result.options)
     confirmed = summary.flight_matches + summary.program_matches
     log(f"cross-check: {files} FlightPoints file(s), {len(entries)} entries, {confirmed} of {len(result.options)} rows confirmed")
     if not entries:
-        result.notes.insert(0, f"Cross-check requested but no FlightPoints entries could be read from {files} file(s); rows are seats.aero only.")
+        if summary.answered:
+            result.notes.insert(0, f"FlightPoints was queried ({files} searches) and reported no business or first space on this route and date(s), "
+                                   "so none of these rows is confirmed by a second source. Treat them as seats.aero-only until you check the program's site.")
+        else:
+            result.notes.insert(0, f"Cross-check requested but no FlightPoints entries could be read from {files} file(s); rows are seats.aero only.")
         return
     note = (f"Cross-checked against FlightPoints ({len(entries)} entries): {confirmed} of {len(result.options)} rows confirmed by both sources"
             f" ({summary.flight_matches} by exact flight, {summary.program_matches} by program and price) and grouped at the top.")
