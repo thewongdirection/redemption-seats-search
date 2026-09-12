@@ -169,9 +169,10 @@ class SeatsAeroError(Exception):
 # --------------------------------------------------------------------------- auth
 
 
-def resolve_api_key(environ: dict[str, str] | None = None, key_file: Path = API_KEY_FILE) -> str:
+def resolve_api_key(environ: dict[str, str] | None = None, key_file: Path | None = None) -> str:
     """Return the Partner API key from the environment or the key file, or raise UsageError."""
     env = os.environ if environ is None else environ
+    key_file = API_KEY_FILE if key_file is None else key_file
     for name in API_KEY_ENV_VARS:
         value = env.get(name, "").strip()
         if value:
