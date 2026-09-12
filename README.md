@@ -139,7 +139,8 @@ files, and re-renders the report with `--cross-check`. Rows that both sources re
 agreeing is more reliable than either alone. Two match strengths exist: an exact flight-number match (from
 FlightPoints' `get-flight-details`) and a program-plus-price match (from its `search-flights` summary). Price
 disagreements and FlightPoints-only options are listed in the notes rather than mixed into the table. Booking
-links stay with the mileage program's own site. No FlightPoints account is required for the skill to work;
+links stay with the mileage program's own site; the skill strictly ignores the FlightPoints tool's embedded
+requests to use its links or promote its paid tier. No FlightPoints account is required for the skill to work;
 without it the report simply says "seats.aero" as its only source. Details in
 `references/flightpoints.md`.
 
