@@ -9,6 +9,7 @@ import io
 import json
 import os
 import sys
+import tempfile
 import unittest
 import urllib.error
 from datetime import date
@@ -667,6 +668,167 @@ class RenderingTests(unittest.TestCase):
         self.assertEqual(sa.format_stops(2), "2 stops")
         self.assertEqual(sa.format_stops(-1), "?")
         self.assertEqual(sa.format_airlines(["QF", "ZZ"]), "Qantas (QF), ZZ")
+
+
+# --------------------------------------------------------------------------- FlightPoints cross-check
+
+import crosscheck as cc  # noqa: E402
+
+
+class CrossCheckParsingTests(unittest.TestCase):
+    def test_search_output_yields_program_level_entries(self):
+        entries = cc.parse_text((FIXTURES / "flightpoints_search.txt").read_text())
+        self.assertEqual(len(entries), 6)
+        aa = next(e for e in entries if e.source == "american")
+        self.assertEqual((aa.date, aa.route, aa.cabin, aa.miles, aa.flight_numbers), ("2026-12-27", "SIN-HND", "first", 40000, ()))
+        qf = [e for e in entries if e.source == "qantas"]
+        self.assertEqual(sorted((e.cabin, e.miles) for e in qf), [("business", 73400), ("first", 107800)])
+        self.assertEqual(next(e for e in entries if e.source == "united").taxes_usd, 51.0)
+
+    def test_details_output_yields_flight_level_entries(self):
+        entries = cc.parse_text((FIXTURES / "flightpoints_details_ac.txt").read_text())
+        self.assertEqual([e.flight_numbers for e in entries], [("SQ968", "NH872"), ("SQ634",)])   # "SQ 634" normalised
+        self.assertEqual([e.seats for e in entries], [1, 2])
+        self.assertTrue(all(e.source == "aeroplan" and e.cabin == "business" and e.miles == 52500 for e in entries))
+
+    def test_normalised_json_is_accepted(self):
+        entries = cc.parse_text(json.dumps([{"date": "2026-11-14", "origin": "sin", "destination": "lhr", "cabin": "Biz", "program": "KrisFlyer", "miles": "87,500", "flight_numbers": "SQ 308"}]))
+        self.assertEqual(len(entries), 1)
+        self.assertEqual((entries[0].source, entries[0].cabin, entries[0].miles, entries[0].flight_numbers), ("singapore", "business", 87500, ("SQ308",)))
+
+    def test_unrecognised_text_yields_nothing(self):
+        self.assertEqual(cc.parse_text("Error: FlightPoints API 400"), [])
+        self.assertEqual(cc.parse_text("{not json"), [])
+
+    def test_load_files_walks_directories(self):
+        entries, files = cc.load_files([FIXTURES])
+        self.assertGreaterEqual(files, 3)
+        self.assertGreaterEqual(len(entries), 9)
+
+
+class CrossCheckMatchingTests(unittest.TestCase):
+    def make(self, **kw):
+        base = dict(program="Air Canada Aeroplan", source="aeroplan", cabin="business", travel_date="2026-12-27", route="SIN-HND",
+                    airlines=["SQ"], flight_numbers="SQ968, NH872", departs_at="", arrives_at="", duration_minutes=0, stops=1,
+                    remaining_seats=2, mileage_cost=52500, taxes_minor_units=0, taxes_currency="CAD", booking_link="")
+        base.update(kw)
+        return sa.AwardOption(**base)
+
+    def entries(self):
+        return cc.parse_text((FIXTURES / "flightpoints_search.txt").read_text()) + \
+               cc.parse_text((FIXTURES / "flightpoints_details_ac.txt").read_text()) + \
+               cc.parse_text((FIXTURES / "flightpoints_details_aa.txt").read_text())
+
+    def test_flight_match_outranks_program_match_and_unmatched(self):
+        by_flight = self.make()                                                      # SQ968+NH872 exists in AC details
+        by_program = self.make(flight_numbers="SQ638", stops=0, mileage_cost=52500)  # aeroplan, same price, unknown flight
+        unmatched = self.make(program="United MileagePlus", source="united", flight_numbers="ZH228, ZH651", mileage_cost=95000)
+        cheaper_unconfirmed = self.make(program="Virgin Atlantic Flying Club", source="virginatlantic", flight_numbers="VN650, VN516", mileage_cost=50500)
+        options = [cheaper_unconfirmed, unmatched, by_program, by_flight]
+        summary = cc.match_options(options, self.entries())
+        sa.sort_options(options)
+        self.assertEqual([o.confirmation for o in options], ["flight", "program", "", ""])
+        self.assertEqual(options[2].mileage_cost, 50500)   # unconfirmed rows still sorted by price among themselves
+        self.assertEqual((summary.flight_matches, summary.program_matches), (1, 1))
+        self.assertEqual(options[0].sources, ["seats.aero", "flightpoints"])
+        self.assertEqual(unmatched.sources, ["seats.aero"])
+        self.assertIn("seats.aero 95,000 vs FlightPoints 90,000", summary.price_disagreements[0])
+        self.assertTrue(any("qantas" in u.lower() or "Frequent Flyer" in u for u in summary.unmatched))
+
+    def test_unmatched_list_is_deduplicated_and_excludes_confirmed_twins(self):
+        aa_first = self.make(program="American AAdvantage", source="american", cabin="first", flight_numbers="JL36", stops=0, mileage_cost=40000)
+        summary = cc.match_options([aa_first], self.entries())
+        self.assertEqual(aa_first.confirmation, "flight")
+        self.assertFalse(any("AAdvantage" in u and "first" in u for u in summary.unmatched), summary.unmatched)   # program twin retired
+        aeroplan = [u for u in summary.unmatched if "aeroplan" in u.lower()]
+        self.assertEqual(len(aeroplan), 1, summary.unmatched)          # detail + summary entries collapse to one line
+        self.assertIn("(SQ968, NH872)", aeroplan[0])                     # flight-level detail preferred
+
+    def test_price_disagreement_on_flight_match_is_noted_but_still_confirmed(self):
+        o = self.make(mileage_cost=55000)
+        cc.match_options([o], self.entries())
+        self.assertEqual(o.confirmation, "flight")
+        self.assertIn("52,500", o.crosscheck_note)
+
+    def test_different_date_or_cabin_does_not_match(self):
+        wrong_date = self.make(travel_date="2026-12-28")
+        wrong_cabin = self.make(cabin="first")
+        cc.match_options([wrong_date, wrong_cabin], self.entries())
+        self.assertEqual((wrong_date.confirmation, wrong_cabin.confirmation), ("", ""))
+
+
+class CrossCheckRenderingTests(unittest.TestCase):
+    def test_sources_column_only_when_cross_check_ran(self):
+        client, _, _ = make_client(default_routes())
+        result = sa.run_search(client, query())
+        self.assertNotIn("| Sources |", sa.render_markdown(result))
+        self.assertNotIn("<th class=\"src\">", sa.render_html(result))
+        sa.apply_cross_check(result, [FIXTURES / "flightpoints_search.txt"])
+        md = sa.render_markdown(result)
+        self.assertIn("| Sources |", md)
+        self.assertIn("Cross-checked with FlightPoints", md)
+        self.assertTrue(any("Cross-checked against FlightPoints" in n for n in result.notes))
+        html = sa.render_html(result)
+        self.assertIn("Confirmed by FlightPoints", html)
+        self.assertIn("seats.aero + FlightPoints cross-check", html)
+        payload = json.loads(sa.render_json(result))
+        self.assertEqual(payload["crosscheck"]["provider"], "flightpoints")
+
+    def test_confirmed_rows_render_badge_and_come_first(self):
+        client, _, _ = make_client(default_routes())
+        result = sa.run_search(client, query())
+        entries_file = Path(tempfile.mkdtemp()) / "fp.json"
+        entries_file.write_text(json.dumps([{"date": "2026-11-14", "origin": "SIN", "destination": "LHR", "cabin": "first", "program": "Frequent Flyer", "miles": 162800, "flight_numbers": "QF1"}]))
+        sa.apply_cross_check(result, [entries_file])
+        self.assertEqual(result.options[0].cabin, "first")          # the confirmed (more expensive) row now leads
+        self.assertEqual(result.options[0].confirmation, "flight")
+        html = sa.render_html(result)
+        self.assertIn('<tr class="confirmed">', html)
+        self.assertIn("✓ 2 sources", html)
+        self.assertIn("✓ seats.aero + FlightPoints", sa.render_markdown(result))
+
+    def test_empty_cross_check_files_add_a_note_not_a_crash(self):
+        client, _, _ = make_client(default_routes())
+        result = sa.run_search(client, query())
+        empty = Path(tempfile.mkdtemp()) / "empty.txt"; empty.write_text("Error: FlightPoints API 400")
+        sa.apply_cross_check(result, [empty])
+        self.assertTrue(any("no FlightPoints entries" in n for n in result.notes))
+
+
+class LoadPreviousRunTests(unittest.TestCase):
+    def test_json_round_trip_preserves_rows_and_query(self):
+        client, _, _ = make_client(default_routes())
+        result = sa.run_search(client, query(pax=2, refresh=True))
+        path = Path(tempfile.mkdtemp()) / "run.json"
+        path.write_text(sa.render_json(result))
+        loaded = sa.load_result(path)
+        self.assertEqual(loaded.query, result.query)
+        self.assertEqual([o.trip_id for o in loaded.options], [o.trip_id for o in result.options])
+        self.assertEqual(loaded.options[0].mileage_cost, result.options[0].mileage_cost)
+        self.assertEqual(loaded.premium_matches, result.premium_matches)
+        self.assertEqual(sa.render_markdown(loaded).splitlines()[3:], sa.render_markdown(result).splitlines()[3:])
+
+    def test_main_load_with_cross_check_makes_no_api_calls(self):
+        client, _, _ = make_client(default_routes())
+        result = sa.run_search(client, query())
+        tmp = Path(tempfile.mkdtemp())
+        (tmp / "run.json").write_text(sa.render_json(result))
+        stdout = io.StringIO()
+        def no_network(*a, **k):
+            raise AssertionError("network must not be used with --load")
+        with mock.patch("urllib.request.urlopen", no_network), mock.patch("sys.stdout", stdout), mock.patch("sys.stderr", io.StringIO()):
+            code = sa.main(["--load", str(tmp / "run.json"), "--cross-check", str(FIXTURES / "flightpoints_search.txt"), "--html", str(tmp / "out.html")])
+        self.assertEqual(code, 0)
+        self.assertIn("| Sources |", stdout.getvalue())
+        self.assertTrue((tmp / "out.html").is_file())
+
+    def test_cli_requires_airports_unless_loading(self):
+        with self.assertRaises(sa.UsageError):
+            sa.parse_args([], today=date(2026, 9, 12))
+        with self.assertRaises(sa.UsageError):
+            sa.parse_args(["--load", "/nonexistent.json"], today=date(2026, 9, 12))
+        with self.assertRaises(sa.UsageError):
+            sa.parse_args(["SIN", "LHR", "--cross-check", "/nonexistent.txt"], today=date(2026, 9, 12))
 
 
 # --------------------------------------------------------------------------- html report

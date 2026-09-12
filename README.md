@@ -38,6 +38,8 @@ own Claude account, for both Claude Code on your computer and Claude Code on the
 | Nonstop only | flag | `--direct-only` | no |
 | Programs | seats.aero program codes | `--sources aeroplan,united` | no, defaults to all |
 | Skip the refresh | flag; refresh is on by default (`--refresh-older-than HOURS`, `--refresh-timeout SECONDS` tune it) | `--no-refresh` | no |
+| Cross-check files | FlightPoints tool output files or a directory | `--cross-check award-reports/crosscheck/` | no |
+| Re-render a saved run | path to a previous `--json` output | `--load award-reports/run.json` | no; replaces the airports and date |
 
 seats.aero caches about 340–355 days ahead depending on the route. A date beyond that returns no records at
 all rather than an error; the report says so, and you re-run once the date falls inside the window.
@@ -125,6 +127,30 @@ Date: 2026-11-14 · Passengers: 2 · Cabins: Business, First
 | 2 | Qantas Frequent Flyer | First | Qantas (QF) | QF1 | 23:30 → 06:15 (+1) | 14h 45m | nonstop | ? | 162,800 | 520.00 AUD | 2d ago | [book](…) |
 ```
 
+## Data sources
+
+**seats.aero is the primary source.** Every figure in the report comes from the seats.aero Partner API and,
+by default, a fresh re-scrape it performs before the report is built.
+
+**FlightPoints is an optional counter-check.** When the FlightPoints MCP server is connected to the Claude
+session, Claude also queries it for the same route, dates, cabins and party size, saves the tool output to
+files, and re-renders the report with `--cross-check`. Rows that both sources report are marked
+"✓ 2 sources" in a Sources column and grouped at the top, on the principle that two independent scrapers
+agreeing is more reliable than either alone. Two match strengths exist: an exact flight-number match (from
+FlightPoints' `get-flight-details`) and a program-plus-price match (from its `search-flights` summary). Price
+disagreements and FlightPoints-only options are listed in the notes rather than mixed into the table. Booking
+links stay with the mileage program's own site. No FlightPoints account is required for the skill to work;
+without it the report simply says "seats.aero" as its only source. Details in
+`references/flightpoints.md`.
+
+```bash
+python3 scripts/search_awards.py SIN HND --date 2026-12-27 --pax 2 --json > award-reports/run.json
+#   ...Claude saves FlightPoints tool output under award-reports/crosscheck/...
+python3 scripts/search_awards.py --load award-reports/run.json --cross-check award-reports/crosscheck/
+```
+
+`--load` re-renders a previous `--json` run without calling seats.aero, so the cross-check costs no quota.
+
 ## How it works
 
 1. `GET /partnerapi/search` for the route and date window (cached availability across ~26 programs).
@@ -151,7 +177,7 @@ drive a seats.aero MCP server.
 ## Development
 
 ```bash
-./run_tests.sh              # 81 offline unit tests, network mocked
+./run_tests.sh              # 96 offline unit tests, network mocked
 ./scripts/check_secrets.sh  # credential scan
 ```
 
@@ -159,9 +185,11 @@ drive a seats.aero MCP server.
 
 ```
 SKILL.md                     skill instructions Claude reads
+scripts/crosscheck.py        FlightPoints output parsing and matching
+references/flightpoints.md   observed FlightPoints tool formats and match rules
 SETUP.md                     step-by-step onboarding for a new user
 CLAUDE.md                    points Claude at SKILL.md in web sessions on this repo
-scripts/search_awards.py     the search tool
+scripts/search_awards.py     the search tool (seats.aero)
 scripts/check_secrets.sh     credential scanner
 references/                  API notes and MCP alternative
 tests/                       regression suite and API fixtures

@@ -36,6 +36,9 @@ from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable, Iterator, Sequence
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import crosscheck  # noqa: E402  (sibling module: FlightPoints cross-check parsing and matching)
+
 BASE_URL = "https://seats.aero/partnerapi"
 API_KEY_ENV_VARS = ("SEATS_AERO_API_KEY", "SEATS_API_KEY")
 API_KEY_FILE = Path.home() / ".config" / "seats-aero" / "api_key"
@@ -489,10 +492,17 @@ class AwardOption:
     trip_id: str = ""
     updated_at: str = ""
     detail_level: str = "trip"  # "trip" or "summary"
+    sources: list[str] = field(default_factory=lambda: ["seats.aero"])
+    confirmation: str = ""      # "" | "program" | "flight" - how a second source agreed with this row
+    crosscheck_note: str = ""   # e.g. "FlightPoints quotes 55,000 miles" when the sources disagree on price
 
     @property
     def seats_known(self) -> bool:
         return self.remaining_seats > 0
+
+    @property
+    def confirmed(self) -> bool:
+        return bool(self.confirmation)
 
 
 @dataclass
@@ -556,6 +566,7 @@ class SearchResult:
     refresh: RefreshOutcome | None = None
     premium_matches: int = 0          # availability records that reported space in a requested cabin
     searched_on: date | None = None   # calendar date of the search; horizon messaging is relative to this
+    crosscheck: crosscheck.CrossCheckSummary | None = None
 
     def explain_no_results(self) -> str:
         """Why the table is empty, in terms the user can act on. Only meaningful when options is empty."""
@@ -667,7 +678,7 @@ def run_search(client: SeatsAeroClient, query: SearchQuery, log: Callable[[str],
     if query.date_mode == "schedule-opening":
         notes.append(f"No date was given, so this scanned {SCHEDULE_OPENING_DAYS[0]}-{SCHEDULE_OPENING_DAYS[1]} days out, where airlines first release award inventory.")
 
-    options.sort(key=lambda o: (o.mileage_cost or 10**9, o.taxes_minor_units, o.departs_at))
+    sort_options(options)
     now = datetime.now(timezone.utc)
     return SearchResult(
         query=query,
@@ -876,6 +887,12 @@ def format_taxes(minor_units: int, currency: str) -> str:
     return f"{minor_units / 100:,.2f} {currency}".strip()
 
 
+def format_sources(o: AwardOption) -> str:
+    if o.confirmed:
+        return "✓ seats.aero + FlightPoints" + (f" ({o.crosscheck_note})" if o.crosscheck_note else "")
+    return "seats.aero" + (f" ({o.crosscheck_note})" if o.crosscheck_note else "")
+
+
 def format_airlines(codes: Sequence[str]) -> str:
     if not codes:
         return "-"
@@ -899,6 +916,61 @@ def format_age(updated_at: str) -> str:
     if hours < 48:
         return f"{hours:.0f}h ago"
     return f"{hours / 24:.0f}d ago"
+
+
+def sort_options(options: list[AwardOption]) -> None:
+    """Rows confirmed by two sources first (flight-level before program-level), then by price."""
+    options.sort(key=lambda o: (crosscheck.CONFIRMATION_RANK.get(o.confirmation, 2), o.mileage_cost or 10**9, o.taxes_minor_units, o.departs_at))
+
+
+def apply_cross_check(result: SearchResult, paths: Sequence[Path], log: Callable[[str], None] = lambda _: None) -> None:
+    """Match FlightPoints output files against the seats.aero rows and regroup the report."""
+    entries, files = crosscheck.load_files(list(paths))
+    summary = crosscheck.match_options(result.options, entries)
+    summary.files = files
+    result.crosscheck = summary
+    sort_options(result.options)
+    confirmed = summary.flight_matches + summary.program_matches
+    log(f"cross-check: {files} FlightPoints file(s), {len(entries)} entries, {confirmed} of {len(result.options)} rows confirmed")
+    if not entries:
+        result.notes.insert(0, f"Cross-check requested but no FlightPoints entries could be read from {files} file(s); rows are seats.aero only.")
+        return
+    note = (f"Cross-checked against FlightPoints ({len(entries)} entries): {confirmed} of {len(result.options)} rows confirmed by both sources"
+            f" ({summary.flight_matches} by exact flight, {summary.program_matches} by program and price) and grouped at the top.")
+    if summary.price_disagreements:
+        note += f" Price differed on {len(summary.price_disagreements)}: " + "; ".join(summary.price_disagreements[:3]) + ("…" if len(summary.price_disagreements) > 3 else "") + "."
+    if summary.unmatched:
+        note += f" FlightPoints also lists {len(summary.unmatched)} premium option(s) seats.aero did not: " + "; ".join(summary.unmatched[:4]) + ("…" if len(summary.unmatched) > 4 else "") + "."
+    result.notes.insert(0, note)
+
+
+def load_result(path: Path) -> SearchResult:
+    """Rebuild a SearchResult from a previous --json run so a report can be re-rendered without API calls."""
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    q = dict(payload["query"])
+    query = SearchQuery(
+        origin=q["origin"], destination=q["destination"],
+        start_date=date.fromisoformat(q["start_date"]), end_date=date.fromisoformat(q["end_date"]),
+        pax=int(q["pax"]), cabins=tuple(q.get("cabins") or DEFAULT_CABINS), direct_only=bool(q.get("direct_only")),
+        sources=tuple(q.get("sources") or ()), max_trip_lookups=int(q.get("max_trip_lookups", DEFAULT_TRIP_LOOKUPS)),
+        date_mode=q.get("date_mode", "exact"), refresh=bool(q.get("refresh", True)),
+        refresh_older_than_hours=float(q.get("refresh_older_than_hours", DEFAULT_REFRESH_OLDER_THAN_HOURS)),
+        refresh_timeout_seconds=float(q.get("refresh_timeout_seconds", DEFAULT_REFRESH_TIMEOUT_SECONDS)),
+    )
+    field_names = {f.name for f in AwardOption.__dataclass_fields__.values()}
+    options = [AwardOption(**{k: v for k, v in item.items() if k in field_names}) for item in payload.get("options", [])]
+    refresh = None
+    if payload.get("refresh"):
+        r = payload["refresh"]
+        refresh = RefreshOutcome(requested=int(r.get("requested", 0)), statuses=dict(r.get("statuses") or {}), quota=dict(r.get("quota") or {}),
+                                 timed_out=bool(r.get("timed_out")), waited_seconds=float(r.get("waited_seconds", 0)), capped_from=int(r.get("capped_from", 0)))
+    searched_on = payload.get("searched_on")
+    return SearchResult(
+        query=query, options=options, notes=list(payload.get("notes") or []), api_calls=int(payload.get("api_calls", 0)),
+        availabilities_seen=int(payload.get("availabilities_seen", 0)), generated_at=str(payload.get("generated_at", "")),
+        refresh=refresh, premium_matches=int(payload.get("premium_matches", 0)),
+        searched_on=date.fromisoformat(searched_on) if searched_on else None,
+    )
 
 
 def safe_url(url: str) -> str:
@@ -981,20 +1053,24 @@ def _updated_html(o: AwardOption) -> str:
     return text
 
 
-def html_columns(q: SearchQuery) -> list[Column]:
-    return [c for c in table_columns(q) if c.in_html]
+def html_columns(q: SearchQuery, with_sources: bool = False) -> list[Column]:
+    return [c for c in table_columns(q, with_sources) if c.in_html]
 
 
-def markdown_columns(q: SearchQuery) -> list[Column]:
-    return [c for c in table_columns(q) if c.in_markdown]
+def markdown_columns(q: SearchQuery, with_sources: bool = False) -> list[Column]:
+    return [c for c in table_columns(q, with_sources) if c.in_markdown]
 
 
-def table_columns(q: SearchQuery) -> list[Column]:
-    """Date and Route only earn a column when they vary between rows."""
+def table_columns(q: SearchQuery, with_sources: bool = False) -> list[Column]:
+    """Date and Route only earn a column when they vary between rows; Sources only when a cross-check ran."""
     cols = [
         Column("#", lambda i, o: str(i), lambda i, o: str(i), "num"),
         Column("Program", lambda i, o: o.program, lambda i, o: _html_program(o), "wrap"),
         Column("Cabin", lambda i, o: o.cabin.title(), lambda i, o: f'<span class="badge {_esc(o.cabin)}">{_esc(o.cabin.title())}</span>'),
+    ]
+    if with_sources:
+        cols.append(Column("Sources", lambda i, o: format_sources(o), lambda i, o: _html_sources(o), "src"))
+    cols += [
         Column("Airline", lambda i, o: format_airlines(o.airlines), lambda i, o: _html_airlines(o.airlines), "wrap"),
         Column("Flights", lambda i, o: o.flight_numbers, lambda i, o: _flights_html(o)),
     ]
@@ -1034,7 +1110,8 @@ def render_markdown(result: SearchResult, report_path: Path | None = None) -> st
     lines = [
         f"## Premium-cabin award seats {q.origin_label} → {q.destination_label}",
         f"{'Date' if q.single_day else 'Dates'}: {q.window_label} · Passengers: {q.pax} · Cabins: {', '.join(c.title() for c in q.cabins)}"
-        + (" · Nonstop only" if q.direct_only else "") + (" · Refreshed before reporting" if q.refresh else " · Cached data, no refresh"),
+        + (" · Nonstop only" if q.direct_only else "") + (" · Refreshed before reporting" if q.refresh else " · Cached data, no refresh")
+        + (" · Cross-checked with FlightPoints" if result.crosscheck is not None else ""),
         "",
     ]
     if not result.options:
@@ -1048,7 +1125,7 @@ def render_markdown(result: SearchResult, report_path: Path | None = None) -> st
             lines.append(f"\n_HTML report: {report_path}_")
         return "\n".join(lines)
 
-    columns = markdown_columns(q)
+    columns = markdown_columns(q, result.crosscheck is not None)
     lines += ["| " + " | ".join(c.header for c in columns) + " |", "|" + "---|" * len(columns)]
     for idx, o in enumerate(result.options, start=1):
         lines.append("| " + " | ".join(c.markdown(idx, o).replace("|", "/") for c in columns) + " |")
@@ -1071,6 +1148,7 @@ def render_json(result: SearchResult, report_path: Path | None = None) -> str:
             "end_date": result.query.end_date.isoformat(),
         },
         "refresh": result.refresh.to_json() if result.refresh else None,
+        "crosscheck": result.crosscheck.to_json() if result.crosscheck else None,
         "generated_at": result.generated_at,
         "api_calls": result.api_calls,
         "availabilities_seen": result.availabilities_seen,
@@ -1123,6 +1201,9 @@ tr:last-child td{border-bottom:0}
 .badge.first{background:rgba(224,175,104,.18);color:var(--first)}
 .badge.stale{background:rgba(247,118,142,.15);color:var(--warn)}
 .badge.summary{background:rgba(154,163,178,.15);color:var(--muted)}
+.badge.confirmed{background:rgba(158,206,106,.16);color:var(--ok)}
+td.src,th.src{white-space:normal;max-width:110px}
+tr.confirmed td{background:rgba(158,206,106,.05)}
 .muted{color:var(--muted);font-size:11px;white-space:normal}
 td.miles{font-weight:600;font-size:15px}
 a{color:var(--accent);text-decoration:none}
@@ -1158,6 +1239,16 @@ def _html_airlines(codes: Sequence[str]) -> str:
     return ", ".join(_html_link(airline_url(code), AIRLINE_NAMES.get(code, code)) for code in codes)
 
 
+def _html_sources(o: AwardOption) -> str:
+    if o.confirmed:
+        how = "same flight" if o.confirmation == "flight" else "same program and price"
+        title = f"Found by seats.aero and FlightPoints ({how})" + (f"; {o.crosscheck_note}" if o.crosscheck_note else "")
+        return f'<span class="badge confirmed" title="{_esc(title)}">✓ 2 sources</span>'
+    title = "seats.aero only" + (f"; {o.crosscheck_note}" if o.crosscheck_note else "")
+    label = "seats.aero" if not o.crosscheck_note else "seats.aero ≠"
+    return f'<span class="muted" title="{_esc(title)}">{_esc(label)}</span>'
+
+
 def _html_program(o: AwardOption) -> str:
     short = PROGRAM_SHORT_NAMES.get(o.source, o.program)
     return f'<span title="{_esc(o.program)}">{_esc(short)}</span>'
@@ -1184,6 +1275,9 @@ def _html_summary_cards(result: SearchResult) -> str:
             cards.append((f"Best {cabin}", "none", "no space cached"))
     nonstop = sum(1 for o in result.options if o.stops == 0)
     cards.append(("Nonstop options", str(nonstop), "of all itineraries listed"))
+    if result.crosscheck is not None:
+        confirmed = sum(1 for o in result.options if o.confirmed)
+        cards.append(("Confirmed by FlightPoints", f"{confirmed} of {len(result.options)}", "same seats seen by both sources"))
     return "".join(
         f'<div class="card"><div class="label">{_esc(label)}</div><div class="value">{_esc(value)}</div><div class="detail">{_esc(detail)}</div></div>'
         for label, value, detail in cards
@@ -1191,10 +1285,10 @@ def _html_summary_cards(result: SearchResult) -> str:
 
 
 def _html_table(result: SearchResult) -> str:
-    columns = html_columns(result.query)
+    columns = html_columns(result.query, result.crosscheck is not None)
     head = "".join(f'<th{_css(c.css)}>{_esc(c.header)}</th>' for c in columns)
     rows = "".join(
-        "<tr>" + "".join(f"<td{_css(c.css)}>{c.html(idx, o)}</td>" for c in columns) + "</tr>"
+        _css_tr(o) + "".join(f"<td{_css(c.css)}>{c.html(idx, o)}</td>" for c in columns) + "</tr>"
         for idx, o in enumerate(result.options, start=1)
     )
     return f'<div class="tablewrap"><table><thead><tr>{head}</tr></thead><tbody>{rows}</tbody></table></div>'
@@ -1202,6 +1296,10 @@ def _html_table(result: SearchResult) -> str:
 
 def _css(css: str) -> str:
     return f' class="{css}"' if css else ""
+
+
+def _css_tr(o: AwardOption) -> str:
+    return '<tr class="confirmed">' if o.confirmed else "<tr>"
 
 
 def render_html(result: SearchResult) -> str:
@@ -1213,6 +1311,7 @@ def render_html(result: SearchResult) -> str:
     if q.direct_only:
         chips.append(("Routing", "Nonstop only"))
     chips.append(("Data", "refreshed before reporting" if q.refresh else "cached as-is (--no-refresh)"))
+    chips.append(("Sources", "seats.aero + FlightPoints cross-check" if result.crosscheck is not None else "seats.aero"))
     if q.date_mode == "schedule-opening":
         chips.append(("Mode", f"schedule opening, {SCHEDULE_OPENING_DAYS[0]}-{SCHEDULE_OPENING_DAYS[1]} days out"))
     if q.sources:
@@ -1237,7 +1336,8 @@ def render_html(result: SearchResult) -> str:
         f"<title>{_esc(title)}</title><style>{HTML_STYLE}</style></head><body><main>"
         f'<h1>{_esc(q.origin_label)}<span class="arrow">→</span>{_esc(q.destination_label)}</h1>'
         f'<p class="sub">{_esc(q.cabins_label.capitalize())} class award availability from seats.aero. Miles and taxes are per passenger. '
-        "Book links open the mileage program that holds the space; airline links open the operating carrier.</p>"
+        "Book links open the mileage program that holds the space; airline links open the operating carrier."
+        + (" Rows marked ✓ 2 sources were also found by FlightPoints and are listed first." if result.crosscheck is not None else "") + "</p>"
         f'<div class="chips">{chips_html}</div>{body}{notes_html}'
         f"<footer>Generated {_esc(result.generated_at)} · {result.api_calls} seats.aero API calls · cached data, verify before transferring points.</footer>"
         "</main></body></html>"
@@ -1247,13 +1347,15 @@ def render_html(result: SearchResult) -> str:
 # --------------------------------------------------------------------------- cli
 
 
-def parse_args(argv: Sequence[str] | None = None, today: date | None = None) -> tuple[SearchQuery, argparse.Namespace]:
+def parse_args(argv: Sequence[str] | None = None, today: date | None = None) -> tuple[SearchQuery | None, argparse.Namespace]:
     parser = argparse.ArgumentParser(
         prog="search_awards.py",
         description="Find business/first class award seats on seats.aero for a route and date.",
     )
-    parser.add_argument("origin", help="Origin airport IATA code(s), e.g. SIN or LHR,LGW")
-    parser.add_argument("destination", help="Destination airport IATA code(s), e.g. PEK,PKX")
+    parser.add_argument("origin", nargs="?", help="Origin airport IATA code(s), e.g. SIN or LHR,LGW")
+    parser.add_argument("destination", nargs="?", help="Destination airport IATA code(s), e.g. PEK,PKX")
+    parser.add_argument("--load", metavar="RUN.json", default=None, help="Re-render a previous --json run instead of calling seats.aero (no quota spent); origin/destination/--date are then ignored")
+    parser.add_argument("--cross-check", metavar="PATH", nargs="+", action="extend", default=[], help="FlightPoints tool output file(s) or a directory of them; matching rows are marked confirmed and grouped first")
     parser.add_argument("--date", default=None, help=f"Departure date, YYYY-MM-DD. Omit to scan {SCHEDULE_OPENING_DAYS[0]}-{SCHEDULE_OPENING_DAYS[1]} days out (schedule opening)")
     parser.add_argument("--pax", type=int, default=1, help="Number of passengers (1-9). Default 1")
     parser.add_argument("--end-date", default=None, metavar="DATE", help=f"Search every day from --date to this date inclusive (up to {MAX_RANGE_DAYS} days), e.g. a whole month")
@@ -1273,6 +1375,15 @@ def parse_args(argv: Sequence[str] | None = None, today: date | None = None) -> 
     parser.add_argument("--timeout", type=float, default=30.0, help="HTTP timeout in seconds")
     parser.add_argument("--quiet", action="store_true", help="Suppress progress messages on stderr")
     args = parser.parse_args(argv)
+    for path in args.cross_check:
+        if not Path(path).exists():
+            raise UsageError(f"--cross-check path not found: {path}")
+    if args.load:
+        if not Path(args.load).is_file():
+            raise UsageError(f"--load file not found: {args.load}")
+        return None, args
+    if not args.origin or not args.destination:
+        raise UsageError("origin and destination airports are required (or pass --load RUN.json)")
 
     origin = _parse_airports(args.origin, "origin")
     destination = _parse_airports(args.destination, "destination")
@@ -1366,18 +1477,29 @@ def _parse_airports(raw: str, label: str) -> str:
 def main(argv: Sequence[str] | None = None) -> int:
     try:
         query, args = parse_args(argv)
-        api_key = resolve_api_key()
+        api_key = None if args.load else resolve_api_key()
     except UsageError as err:
         print(f"error: {err}", file=sys.stderr)
         return 2
 
     log = (lambda _msg: None) if args.quiet else (lambda msg: print(msg, file=sys.stderr))
-    client = SeatsAeroClient(api_key, timeout=args.timeout)
-    try:
-        result = run_search(client, query, log=log)
-    except SeatsAeroError as err:
-        print(f"error: {err}", file=sys.stderr)
-        return 3
+    if args.load:
+        try:
+            result = load_result(Path(args.load))
+        except (OSError, ValueError, KeyError, TypeError) as err:
+            print(f"error: could not read {args.load} as a previous run: {err}", file=sys.stderr)
+            return 2
+        query = result.query
+        log(f"Loaded previous run from {args.load} ({len(result.options)} rows); no seats.aero calls made")
+    else:
+        client = SeatsAeroClient(api_key, timeout=args.timeout)
+        try:
+            result = run_search(client, query, log=log)
+        except SeatsAeroError as err:
+            print(f"error: {err}", file=sys.stderr)
+            return 3
+    if args.cross_check:
+        apply_cross_check(result, [Path(p) for p in args.cross_check], log=log)
 
     report_path: Path | None = None
     if not args.no_html:

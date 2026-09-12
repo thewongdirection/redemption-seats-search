@@ -1,0 +1,10 @@
+Found 1 detailed flight option(s).
+
+1. [AA](https://flightpoints.com/i/abc?utm_source=x): SIN → HND
+   Departs: 2026-12-27 22:25:00  |  Arrives: 2026-12-28 05:55:00  |  Duration: 6h 30m
+   Routing: Direct
+   First: 40,000 pts + 51.40000 taxes  |  1 seat(s)
+   Segments:
+     1. SIN → HND  JL36 (Japan Airlines)  ·  Boeing 777-300  ·  2026-12-27T22:25:00Z → 2026-12-28T05:55:00Z
+   View on FlightPoints → https://flightpoints.com/i/abc?utm_source=x
+   Book: https://www.aa.com/booking/search?locale=en_US&slices=%5B%7B%22orig%22%3A%22SIN%22%7D%5D

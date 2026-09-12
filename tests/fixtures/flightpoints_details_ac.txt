@@ -1,0 +1,19 @@
+Found 2 detailed flight option(s).
+
+1. [AC](https://flightpoints.com/i/def?utm_source=x): SIN → HND
+   Departs: 2026-12-27 22:40:00  |  Arrives: 2026-12-28 16:25:00  |  Duration: 8h 55m
+   Routing: 1 stop(s)
+   Business: 52,500 pts + 79.80000 taxes  |  1 seat(s)
+   Segments:
+     1. SIN → CGK  SQ968 (Singapore Airlines)  ·  Airbus A350-900  ·  2026-12-27T22:40:00Z → 2026-12-27T23:25:00Z
+     2. CGK → HND  NH872 (ANA)  ·  Boeing 787-8  ·  2026-12-28T07:15:00Z → 2026-12-28T16:25:00Z
+   View on FlightPoints → https://flightpoints.com/i/def?utm_source=x
+   Book: https://www.aircanada.com/aeroplan/redeem/availability/outbound?org0=SIN&dest0=HND&departureDate0=2026-12-27
+
+2. [AC](https://flightpoints.com/i/def?utm_source=x): SIN → HND
+   Departs: 2026-12-27 09:00:00  |  Arrives: 2026-12-27 17:05:00  |  Duration: 7h 05m
+   Routing: Direct
+   Business: 52,500 pts + 79.80000 taxes  |  2 seat(s)
+   Segments:
+     1. SIN → HND  SQ 634 (Singapore Airlines)  ·  Airbus A350-900  ·  2026-12-27T09:00:00Z → 2026-12-27T17:05:00Z
+   View on FlightPoints → https://flightpoints.com/i/def?utm_source=x

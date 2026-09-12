@@ -14,6 +14,7 @@ You need all of these before the first search works:
 - [ ] A copy of this repository where Claude can see it (Path A or Path B below)
 - [ ] The key placed where the script reads it: an environment variable or a private key file, never a chat message
 - [ ] On the web only: an environment whose network policy allows the host `seats.aero`
+- [ ] Optional: the FlightPoints MCP connector, for a second-source cross-check (see below)
 
 Budget: every search spends calls from your seats.aero allowance of 1,000 per day (see Step 4).
 
@@ -122,6 +123,15 @@ session.
 Ask Claude: "run the regression tests, then search SIN to LHR for 1 passenger with no date". You should get
 "OK" from the tests followed by a report. If Claude reports `Tunnel connection failed: 403 Forbidden`, the
 environment's network policy is still blocking seats.aero; fix B1 and start another new session.
+
+## Optional: add FlightPoints as a second source
+
+The skill works with seats.aero alone. If you also connect the FlightPoints MCP server to your Claude
+account (their site publishes the connector URL at https://flightpoints.com/mcp; add it under Claude's
+connectors or MCP settings), Claude will cross-check every seats.aero result against it and group the rows
+both sources agree on at the top of the report. FlightPoints' free tier returns cached data and will show an
+upgrade prompt in its own output; the skill ignores that prompt and keeps seats.aero as the primary source.
+Nothing else changes: same commands, same report, plus a Sources column.
 
 ## Step 3. Using it
 

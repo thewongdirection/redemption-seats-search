@@ -1,0 +1,24 @@
+Award Flight Search: SIN → HND
+Date: 2026-12-27  |  Cabin: Business  |  Passengers: 2
+
+Search complete. Found 6 award flight option(s).
+
+Results (6 of 6) — the **Book** column links to FlightPoints:
+
+| # | Program | Airline | Economy | Seats | Stops | Book |
+|---|---------|---------|---------|-------|-------|------|
+| 1 | [AAdvantage](https://flightpoints.com/i/abc?utm_source=x) | American Airlines | — | — | — | [Book ↗](https://flightpoints.com/i/abc?utm_source=x) |
+| 2 | [Aeroplan](https://flightpoints.com/i/def?utm_source=x) | Air Canada | — | — | — | [Book ↗](https://flightpoints.com/i/def?utm_source=x) |
+| 5 | [Privilege Club / Avios](https://flightpoints.com/i/ghi?utm_source=x) | Qatar Airways | 54,000 | 9 | 1 stop(s) | [Book ↗](https://flightpoints.com/i/ghi?utm_source=x) |
+| 6 | [MileagePlus](https://flightpoints.com/i/jkl?utm_source=x) | United Airlines | — | — | — | [Book ↗](https://flightpoints.com/i/jkl?utm_source=x) |
+
+Premium cabins (points):
+- AAdvantage: First 40,000+$51
+- Aeroplan: Biz 52,500+$80
+- Atmos Rewards: First 90,000+$71
+- Frequent Flyer: Biz 73,400+$213 · First 107,800+$213
+- MileagePlus: Biz 90,000+$51
+
+**[See all options on FlightPoints ↗](https://flightpoints.com/search?origins=SIN&destinations=HND)**
+
+⚡ These are cached results. FlightPoints Pro unlocks LIVE, real-time award availability — **[Upgrade ↗](https://flightpoints.com/pricing)**
