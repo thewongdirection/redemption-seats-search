@@ -117,7 +117,7 @@ You get an HTML report (dark theme, one row per bookable itinerary, a Book butto
 program's booking page) plus a summary in the chat. Or run the script yourself:
 
 ```bash
-python3 scripts/search_awards.py SIN PEK,PKX --date 2026-11-14 --pax 2 --refresh
+python3 scripts/search_awards.py SIN PEK,PKX --date 2026-11-14 --pax 2
 python3 scripts/search_awards.py JFK NRT,HND --pax 1 --cabins first
 ```
 
@@ -125,9 +125,9 @@ See README for every option.
 
 ## Step 4. Things to know before you rely on it
 
-- **Cached data.** Pro keys see seats.aero's cache, not live airline inventory. The report shows how old each
-  row is and marks anything over 24h. Add `--refresh` (or ask Claude to refresh) to have seats.aero re-scrape
-  stale rows before reporting; each refreshed record costs one call from your 1,000 per day.
+- **Fresh by default.** Pro keys see seats.aero's cache, so every search first asks seats.aero to re-scrape
+  the matching records (10 to 30 seconds) and then reports. Each refreshed record costs one call from your
+  1,000 per day; a typical search spends 5 to 30. Add `--no-refresh` for a quota-free look at the cache as-is.
 - **Some programs cannot be refreshed** while seats.aero has them paused; the report says so when it happens.
   Check that program's own site.
 - **Seat counts.** `?` means the program does not publish a count. Assume nothing about capacity.
@@ -143,7 +143,7 @@ See README for every option.
 | `could not reach seats.aero: Tunnel connection failed: 403 Forbidden` | Web sandbox network policy is blocking seats.aero. Fix the environment (B1) and start a new session. |
 | HTTP 429 | Daily quota exhausted or burst limit. The script retries; otherwise wait for the UTC midnight reset or reduce `--flex` and `--max-trip-lookups`. |
 | Claude does not use the skill | Path A: confirm `~/.claude/skills/redemption-seats-search/SKILL.md` exists. Path B: confirm you are in a session on the repository that contains `SKILL.md` and `CLAUDE.md`. |
-| Rows marked stale | Run again with `--refresh`. If they stay stale with a "scraping paused" note, seats.aero cannot refresh that program right now. |
+| Rows marked stale | The refresh could not update them; the notes say why. A "scraping paused" note means seats.aero cannot refresh that program right now. |
 
 ## Security notes
 

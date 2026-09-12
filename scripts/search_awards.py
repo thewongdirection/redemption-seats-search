@@ -47,8 +47,11 @@ DEFAULT_CABINS = ("business", "first")
 MAX_PAGES = 20            # safety cap on cached-search pagination
 REFRESH_BATCH = 250        # seats.aero accepts at most 250 availability IDs per refresh request
 REFRESH_POLL_SECONDS = 5.0
-DEFAULT_REFRESH_OLDER_THAN_HOURS = 24.0
+# Every search re-scrapes its matches by default so the report reflects what the programs
+# show right now, not what seats.aero happened to cache. 0 hours means "everything that matched".
+DEFAULT_REFRESH_OLDER_THAN_HOURS = 0.0
 DEFAULT_REFRESH_TIMEOUT_SECONDS = 120.0
+MAX_REFRESH_RECORDS = 100  # each refreshed record spends one call of the 1,000/day quota; oldest go first
 # With no --date, scan the far edge of the booking window: most airlines load award
 # inventory 354-355 days ahead, so this is where fresh premium space first appears.
 SCHEDULE_OPENING_DAYS = (354, 355)
@@ -366,6 +369,7 @@ class RefreshOutcome:
     quota: dict[str, Any] = field(default_factory=dict)
     timed_out: bool = False
     waited_seconds: float = 0.0
+    capped_from: int = 0  # matches that existed when only MAX_REFRESH_RECORDS of them were refreshed
 
     def absorb(self, response: dict[str, Any]) -> None:
         for item in response.get("items") or []:
@@ -402,7 +406,9 @@ class RefreshOutcome:
             parts.append(f"{self.failed} failed")
         if self.processing:
             parts.append(f"{self.processing} still processing when the wait timed out")
-        text = f"Refresh of {self.requested} stale record{'s' if self.requested != 1 else ''}: " + ", ".join(parts) + "."
+        text = f"Refreshed before reporting ({self.requested} record{'s' if self.requested != 1 else ''}): " + ", ".join(parts) + "."
+        if self.capped_from:
+            text += f" Only the {self.requested} oldest of {self.capped_from} matches were refreshed to protect the daily quota."
         if self.quota:
             text += f" Daily API quota: {self.quota.get('remaining')}/{self.quota.get('limit')} calls remaining."
         return text
@@ -411,7 +417,7 @@ class RefreshOutcome:
         return {
             "requested": self.requested, "succeeded": self.succeeded, "skipped": self.skipped, "failed": self.failed,
             "still_processing": self.processing, "timed_out": self.timed_out, "waited_seconds": self.waited_seconds,
-            "statuses": self.statuses, "quota": self.quota,
+            "capped_from": self.capped_from, "statuses": self.statuses, "quota": self.quota,
         }
 
 
@@ -483,7 +489,7 @@ class SearchQuery:
     sources: tuple[str, ...] = ()
     max_trip_lookups: int = DEFAULT_TRIP_LOOKUPS
     date_mode: str = "exact"           # exact | flex | schedule-opening
-    refresh: bool = False
+    refresh: bool = True
     refresh_older_than_hours: float = DEFAULT_REFRESH_OLDER_THAN_HOURS
     refresh_timeout_seconds: float = DEFAULT_REFRESH_TIMEOUT_SECONDS
 
@@ -574,12 +580,17 @@ def _fetch_candidates(client: SeatsAeroClient, query: SearchQuery, log: Callable
 
 
 def _refresh_stale(client: SeatsAeroClient, candidates: list[dict[str, Any]], query: SearchQuery, log: Callable[[str], None]) -> RefreshOutcome | None:
-    stale_ids = [a["ID"] for a in candidates if _hours_since(str(a.get("UpdatedAt") or "")) > query.refresh_older_than_hours]
-    if not stale_ids:
+    stale = [a for a in candidates if _hours_since(str(a.get("UpdatedAt") or "")) > query.refresh_older_than_hours]
+    if not stale:
         log(f"refresh: nothing older than {query.refresh_older_than_hours:g}h to refresh")
         return None
-    log(f"refresh: asking seats.aero to re-scrape {len(stale_ids)} record(s) older than {query.refresh_older_than_hours:g}h")
-    return client.refresh_and_wait(stale_ids, timeout_seconds=query.refresh_timeout_seconds, log=log)
+    stale.sort(key=lambda a: _hours_since(str(a.get("UpdatedAt") or "")), reverse=True)
+    capped = len(stale) > MAX_REFRESH_RECORDS
+    stale_ids = [a["ID"] for a in stale[:MAX_REFRESH_RECORDS]]
+    log(f"refresh: asking seats.aero to re-scrape {len(stale_ids)} of {len(stale)} matching record(s)")
+    outcome = client.refresh_and_wait(stale_ids, timeout_seconds=query.refresh_timeout_seconds, log=log)
+    outcome.capped_from = len(stale) if capped else 0
+    return outcome
 
 
 def run_search(client: SeatsAeroClient, query: SearchQuery, log: Callable[[str], None] = lambda _: None) -> SearchResult:
@@ -595,8 +606,8 @@ def run_search(client: SeatsAeroClient, query: SearchQuery, log: Callable[[str],
         except SeatsAeroError as err:
             notes.append(f"Refresh was not possible ({err}); showing cached data as-is.")
         else:
-            if refresh_outcome is None:
-                notes.append(f"Refresh requested, but every matching record was already newer than {query.refresh_older_than_hours:g}h.")
+            if refresh_outcome is None and candidates:
+                notes.append(f"No refresh needed: every matching record was already newer than {query.refresh_older_than_hours:g}h.")
             else:
                 notes.append(refresh_outcome.summary())
                 if refresh_outcome.succeeded or refresh_outcome.processing:
@@ -994,7 +1005,7 @@ def render_markdown(result: SearchResult, report_path: Path | None = None) -> st
     lines = [
         f"## Premium-cabin award seats {q.origin_label} → {q.destination_label}",
         f"{'Date' if q.single_day else 'Dates'}: {q.window_label} · Passengers: {q.pax} · Cabins: {', '.join(c.title() for c in q.cabins)}"
-        + (" · Nonstop only" if q.direct_only else "") + (" · Refresh requested" if q.refresh else ""),
+        + (" · Nonstop only" if q.direct_only else "") + (" · Refreshed before reporting" if q.refresh else " · Cached data, no refresh"),
         "",
     ]
     if not result.options:
@@ -1166,8 +1177,7 @@ def render_html(result: SearchResult) -> str:
     ]
     if q.direct_only:
         chips.append(("Routing", "Nonstop only"))
-    if q.refresh:
-        chips.append(("Refresh", "requested for records older than %gh" % q.refresh_older_than_hours))
+    chips.append(("Data", "refreshed before reporting" if q.refresh else "cached as-is (--no-refresh)"))
     if q.date_mode == "schedule-opening":
         chips.append(("Mode", f"schedule opening, {SCHEDULE_OPENING_DAYS[0]}-{SCHEDULE_OPENING_DAYS[1]} days out"))
     if q.sources:
@@ -1216,9 +1226,11 @@ def parse_args(argv: Sequence[str] | None = None, today: date | None = None) -> 
     parser.add_argument("--direct-only", action="store_true", help="Only nonstop itineraries")
     parser.add_argument("--sources", default="", help="Comma list of seats.aero program codes to restrict to (e.g. aeroplan,united)")
     parser.add_argument("--max-trip-lookups", type=int, default=DEFAULT_TRIP_LOOKUPS, help=f"Cap on per-availability trip detail calls. Default {DEFAULT_TRIP_LOOKUPS}")
-    parser.add_argument("--refresh", action="store_true", help="Ask seats.aero to re-scrape stale matches before reporting (Pro keys; spends daily quota)")
-    parser.add_argument("--refresh-older-than", type=float, default=DEFAULT_REFRESH_OLDER_THAN_HOURS, metavar="HOURS", help=f"With --refresh, only records older than this. Default {DEFAULT_REFRESH_OLDER_THAN_HOURS:g}")
-    parser.add_argument("--refresh-timeout", type=float, default=DEFAULT_REFRESH_TIMEOUT_SECONDS, metavar="SECONDS", help=f"With --refresh, how long to wait for seats.aero. Default {DEFAULT_REFRESH_TIMEOUT_SECONDS:g}")
+    parser.add_argument("--no-refresh", dest="refresh", action="store_false", help="Report seats.aero's cached data as-is instead of re-scraping matches first (saves quota)")
+    parser.add_argument("--refresh", dest="refresh", action="store_true", help=argparse.SUPPRESS)  # default; kept for older docs
+    parser.set_defaults(refresh=True)
+    parser.add_argument("--refresh-older-than", type=float, default=DEFAULT_REFRESH_OLDER_THAN_HOURS, metavar="HOURS", help=f"Only re-scrape records older than this many hours. Default {DEFAULT_REFRESH_OLDER_THAN_HOURS:g} (everything that matched, up to {MAX_REFRESH_RECORDS})")
+    parser.add_argument("--refresh-timeout", type=float, default=DEFAULT_REFRESH_TIMEOUT_SECONDS, metavar="SECONDS", help=f"How long to wait for seats.aero to finish re-scraping. Default {DEFAULT_REFRESH_TIMEOUT_SECONDS:g}")
     parser.add_argument("--json", action="store_true", help="Emit JSON instead of a markdown table")
     parser.add_argument("--html", metavar="PATH", default=None, help=f"Where to write the HTML report. Default {DEFAULT_REPORT_DIR}/awards_<route>_<date>_pax<N>.html")
     parser.add_argument("--no-html", action="store_true", help="Skip writing the HTML report")

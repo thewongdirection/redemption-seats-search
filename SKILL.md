@@ -22,7 +22,7 @@ result so the user can act on it.
 | Flexibility | optional | `--flex N` searches ±N days. Offer it when a date returns nothing. |
 | Cabin | optional | Default is business **and** first. Use `--cabins first` when the user only wants first. Economy and premium economy are out of scope; the script refuses them. |
 | Nonstop only | optional | `--direct-only`. |
-| Refresh stale data | optional | `--refresh` asks seats.aero to re-scrape matching records older than 24h (tune with `--refresh-older-than HOURS`) and waits up to 120s before reporting. Pro keys only; each refreshed record spends one call of the 1,000/day quota. Use it when the user complains about stale results or when the first run shows rows marked stale and the decision matters. |
+| Fresh data | default on | Every search first asks seats.aero to re-scrape the matching business/first records (oldest first, up to 100) and waits up to 120s, so the report reflects what the programs show now. Each refreshed record spends one call of the 1,000/day quota; a typical search spends 5–30. Pass `--no-refresh` only when the user explicitly wants a quick cached look or is short on quota. `--refresh-older-than HOURS` narrows the refresh to older records. |
 
 If origin, destination or party size is missing, ask for it in one short message rather than guessing. A missing
 date is not a blocker: run without `--date` and explain the schedule-opening scan.
@@ -46,7 +46,7 @@ python3 scripts/search_awards.py SIN PEK,PKX --date 2027-09-02 --pax 2          
 python3 scripts/search_awards.py LAX SYD --date 2026-12-20 --pax 2 --flex 3 --direct-only
 python3 scripts/search_awards.py SFO CDG --date 2026-10-05 --pax 3 --json   # machine-readable
 python3 scripts/search_awards.py SIN NGO --pax 2                             # no date: 354-355 days out
-python3 scripts/search_awards.py SIN PEK,PKX --date 2026-11-14 --pax 2 --refresh   # re-scrape stale rows first
+python3 scripts/search_awards.py SIN PEK,PKX --date 2026-11-14 --pax 2 --no-refresh   # cached data only, saves quota
 ```
 
 Every run produces two things:
@@ -66,8 +66,9 @@ What it does under the hood, so you can explain results:
 1. Calls the seats.aero **Cached Search** endpoint for the route and date window.
 2. Keeps only availability objects that report business (J) or first (F) space.
 3. For each of those, calls **Get Trips** to obtain flight numbers, airline, times, seat count, taxes and a booking link.
-4. Drops itineraries that report fewer seats than requested and itineraries flagged as dynamically priced.
-5. Sorts by miles, then taxes.
+4. Asks seats.aero to re-scrape those records and waits for it (skip with `--no-refresh`), then searches again.
+5. Drops itineraries that report fewer seats than requested and itineraries flagged as dynamically priced.
+6. Sorts by miles, then taxes.
 
 Details of the API, response fields and program codes are in `references/seats-aero-api.md`. Read it only if you
 need to debug an unexpected response or extend the script.
@@ -84,10 +85,10 @@ readable without opening the file. Do not rewrite the numbers. Add anything the 
   Capital One, Bilt) feed that program if you know, but label it as general knowledge, not something the API returned.
 - **Seat counts.** `?` means the program does not publish a count. Say so plainly and suggest the user verify on
   the program's site before transferring points.
-- **Freshness.** The "Updated" column is the cache age. Anything older than a day should be re-verified; the
-  script also prints a note when this applies. Offer `--refresh` for stale rows. If a refresh reports records
-  "skipped because seats.aero has that program's scraping paused", that program (KrisFlyer has been one) cannot
-  be refreshed by anyone right now; the user must check the program's own site. Pro keys never get live search.
+- **Freshness.** Data is re-scraped before every report, so "Updated" should read minutes ago. A row that still
+  shows an old age was one seats.aero could not refresh; the notes say why. "Skipped because seats.aero has that
+  program's scraping paused" means that program (KrisFlyer has been one) cannot be refreshed by anyone right
+  now and the user must check the program's own site. Pro keys never get live search.
 - **Taxes** are per passenger in the program's billing currency. Multiply by party size if the user asks for a total.
 - **Nothing found.** Say so in one line, then offer the concrete next steps: `--flex 3`, alternate airports, or
   checking whether space exists for fewer passengers (`--pax 1`) so they know if it is a party-size problem.

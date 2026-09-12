@@ -36,20 +36,22 @@ own Claude account, for both Claude Code on your computer and Claude Code on the
 | Cabins | `business`, `first`, or both | `--cabins first` | no, defaults to both |
 | Nonstop only | flag | `--direct-only` | no |
 | Programs | seats.aero program codes | `--sources aeroplan,united` | no, defaults to all |
-| Refresh stale rows | flag, plus `--refresh-older-than HOURS` (24) and `--refresh-timeout SECONDS` (120) | `--refresh` | no |
+| Skip the refresh | flag; refresh is on by default (`--refresh-older-than HOURS`, `--refresh-timeout SECONDS` tune it) | `--no-refresh` | no |
 
 seats.aero caches roughly 11 months ahead. A date beyond that returns no records at all rather than an error;
 re-run once the date falls inside the window.
 
-### Stale data and `--refresh`
+### Fresh data on every search
 
-The "Updated" column shows how old seats.aero's cached record is, and rows over 24 hours old are marked stale.
-How often seats.aero re-scrapes each program is up to seats.aero, but Pro accounts can ask for a re-scrape of
-specific records. `--refresh` does that automatically: after the first search it sends every matching business
-or first record older than the threshold to seats.aero's refresh endpoint, polls until they complete (usually
-10 to 30 seconds), then searches again and reports the fresh figures. Each refreshed record spends one call of
-the shared 1,000 per day quota; polling is free. Records for a program whose scraping seats.aero has paused
-come back as "skipped" and cannot be refreshed by anyone until seats.aero restores that program.
+Every search re-scrapes before it reports. After the first cached lookup, the script sends every matching
+business or first record to seats.aero's Pro-only refresh endpoint (oldest first, at most 100 per run), polls
+until they complete (usually 10 to 30 seconds), then searches again and reports the fresh figures. The
+"Updated" column should therefore read minutes ago; a row that still shows an old age is one seats.aero could
+not refresh, and the notes say why. Each refreshed record spends one call of the shared 1,000 per day quota;
+polling is free; a typical search spends 5 to 30 calls in total. Pass `--no-refresh` for a quota-free look at
+the cache as-is, or `--refresh-older-than 24` to re-scrape only day-old rows. Records for a program whose
+scraping seats.aero has paused come back as "skipped" and cannot be refreshed by anyone until seats.aero
+restores that program.
 
 ### Claude Code on the web
 
@@ -102,7 +104,7 @@ python3 scripts/search_awards.py SIN PEK,PKX --date 2027-09-02 --pax 2     # mul
 python3 scripts/search_awards.py JFK NRT --date 2027-03-02 --cabins first --flex 3
 python3 scripts/search_awards.py LAX SYD --date 2026-12-20 --pax 2 --direct-only --json
 python3 scripts/search_awards.py SIN NGO --pax 2                              # no date: 354-355 days out
-python3 scripts/search_awards.py SIN PEK,PKX --date 2026-11-14 --pax 2 --refresh    # re-scrape stale rows first
+python3 scripts/search_awards.py SIN PEK,PKX --date 2026-11-14 --pax 2 --no-refresh   # cached data only, saves quota
 ```
 
 Each run writes `award-reports/awards_SIN-LHR_2026-11-14_pax2.html` (override with `--html PATH`, skip with
@@ -123,8 +125,9 @@ Date: 2026-11-14 · Passengers: 2 · Cabins: Business, First
 1. `GET /partnerapi/search` for the route and date window (cached availability across ~26 programs).
 2. Keep records where `JAvailable` or `FAvailable` is true.
 3. `GET /partnerapi/trips/{id}` for each to get flight-level detail and booking links.
-4. Drop itineraries with fewer seats than requested, and dynamically-priced (`Filtered`) ones.
-5. Sort by miles, then taxes, write the HTML report, and print a markdown table (or JSON with `--json`).
+4. `POST /partnerapi/refresh` for those records, wait for seats.aero to re-scrape them, and search again (`--no-refresh` skips this).
+5. Drop itineraries with fewer seats than requested, and dynamically-priced (`Filtered`) ones.
+6. Sort by miles, then taxes, write the HTML report, and print a markdown table (or JSON with `--json`).
 
 The HTML report is a single self-contained file: no JavaScript, no external fonts or scripts, every value
 HTML-escaped and only `https://` links emitted. Booking deep links come from seats.aero when available; otherwise
@@ -135,15 +138,15 @@ drive a seats.aero MCP server.
 
 ## Limits worth knowing
 
-- Pro keys see **cached** data only. The script shows cache age and flags anything over 24h old. Verify on the
-  program's site before transferring points.
+- Pro keys see **cached** data, so the script re-scrapes matches before every report. Rows that still show an
+  old age could not be refreshed; verify those on the program's site before transferring points.
 - Some programs do not publish seat counts; those rows show `?` and are kept rather than dropped.
 - Live, real-time search (`/live`) requires a commercial agreement with seats.aero.
 
 ## Development
 
 ```bash
-./run_tests.sh              # 73 offline unit tests, network mocked
+./run_tests.sh              # 76 offline unit tests, network mocked
 ./scripts/check_secrets.sh  # credential scan
 ```
 

@@ -75,6 +75,7 @@ def make_client(routes: dict[str, object]) -> tuple[sa.SeatsAeroClient, FakeOpen
 
 def default_routes() -> dict[str, object]:
     return {
+        "refresh": lambda: refresh_response({}, complete=True),
         "search": load_fixture("search_response.json"),
         "trips/avail-aeroplan-1": load_fixture("trips_aeroplan.json"),
         "trips/avail-qantas-first": load_fixture("trips_qantas.json"),
@@ -82,7 +83,7 @@ def default_routes() -> dict[str, object]:
 
 
 def query(**overrides) -> sa.SearchQuery:
-    base = dict(origin="SIN", destination="LHR", start_date=date(2026, 11, 14), end_date=date(2026, 11, 14), pax=1)
+    base = dict(origin="SIN", destination="LHR", start_date=date(2026, 11, 14), end_date=date(2026, 11, 14), pax=1, refresh=False)
     base.update(overrides)
     return sa.SearchQuery(**base)
 
@@ -306,14 +307,50 @@ class RefreshTests(unittest.TestCase):
         self.assertTrue(any("1 refreshed" in n for n in result.notes))
         payload = json.loads(sa.render_json(result))
         self.assertEqual(payload["refresh"]["succeeded"], 1)
-        self.assertIn("Refresh requested", sa.render_markdown(result))
+        self.assertIn("Refreshed before reporting", sa.render_markdown(result))
+        self.assertIn("Cached data, no refresh", sa.render_markdown(sa.run_search(make_client(default_routes())[0], query())))
+
+    def test_default_threshold_refreshes_every_match_oldest_first(self):
+        posted = []
+        def refresh_handler():
+            return refresh_response({}, complete=True)
+        routes = default_routes(); routes["refresh"] = refresh_handler
+        opener = FakeOpener(routes)
+        original = opener.__call__
+        def spy(request, timeout):
+            if request.full_url.endswith("/refresh"):
+                posted.append(json.loads(request.data.decode())["availability_ids"])
+            return original(request, timeout)
+        client = sa.SeatsAeroClient("k", opener=spy, sleep=lambda _: None)
+        sa.run_search(client, query(refresh=True, refresh_older_than_hours=0.0))
+        # qantas (2020) is the only premium match with a past UpdatedAt; the aeroplan fixture is dated 2099 and united is economy-only
+        self.assertEqual(posted, [["avail-qantas-first"]])
+
+    def test_refresh_cap_protects_quota(self):
+        many = load_fixture("search_response.json")
+        template = many["data"][0]
+        many["data"] = [{**template, "ID": f"a{i}", "UpdatedAt": f"2026-01-{(i % 28) + 1:02d}T00:00:00Z"} for i in range(150)]
+        posted = []
+        routes = {"search": many, "refresh": lambda: refresh_response({}, complete=True)}
+        opener = FakeOpener(routes)
+        original = opener.__call__
+        def spy(request, timeout):
+            if request.full_url.endswith("/refresh"):
+                posted.append(json.loads(request.data.decode())["availability_ids"])
+            return original(request, timeout)
+        client = sa.SeatsAeroClient("k", opener=spy, sleep=lambda _: None)
+        with mock.patch.object(sa, "MAX_REFRESH_RECORDS", 100):
+            result = sa.run_search(client, query(refresh=True, max_trip_lookups=0))
+        self.assertEqual(sum(len(b) for b in posted), 100)
+        self.assertEqual(result.refresh.capped_from, 150)
+        self.assertTrue(any("100 oldest of 150" in n for n in result.notes))
 
     def test_run_search_refresh_with_nothing_stale_adds_note_only(self):
         routes = default_routes()
         client, opener, _ = make_client(routes)
         result = sa.run_search(client, query(refresh=True, refresh_older_than_hours=10**7))
         self.assertFalse(any(u.endswith("/refresh") for u in opener.requests))
-        self.assertTrue(any("already newer" in n for n in result.notes))
+        self.assertTrue(any("No refresh needed" in n for n in result.notes))
 
     def test_run_search_survives_refresh_failure(self):
         routes = default_routes()
@@ -415,6 +452,11 @@ class ArgumentValidationTests(unittest.TestCase):
         self.assertEqual((q.start_date, q.end_date), (date(2026, 11, 12), date(2026, 11, 16)))
         self.assertEqual(q.cabins, ("business", "first"))
         self.assertEqual(q.date_mode, "flex")
+        self.assertTrue(q.refresh, "fresh data is the default")
+        self.assertEqual(q.refresh_older_than_hours, 0.0)
+
+    def test_no_refresh_opts_out(self):
+        q, _ = self.parse("SIN", "LHR", "--date", "2026-11-14", "--no-refresh")
         self.assertFalse(q.refresh)
 
     def test_no_date_scans_schedule_opening_window(self):
@@ -429,7 +471,7 @@ class ArgumentValidationTests(unittest.TestCase):
             self.parse("SIN", "LHR", "--flex", "2")
 
     def test_refresh_flags_are_parsed(self):
-        q, _ = self.parse("SIN", "LHR", "--date", "2026-11-14", "--refresh", "--refresh-older-than", "6", "--refresh-timeout", "30")
+        q, _ = self.parse("SIN", "LHR", "--date", "2026-11-14", "--refresh-older-than", "6", "--refresh-timeout", "30")
         self.assertTrue(q.refresh)
         self.assertEqual((q.refresh_older_than_hours, q.refresh_timeout_seconds), (6.0, 30.0))
         with self.assertRaises(sa.UsageError):
