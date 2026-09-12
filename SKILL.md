@@ -27,9 +27,10 @@ result so the user can act on it.
 If origin, destination or party size is missing, ask for it in one short message rather than guessing. A missing
 date is not a blocker: run without `--date` and explain the schedule-opening scan.
 
-Prerequisites the user must already have (see README, "What you need to provide"): a seats.aero Pro membership,
-a Partner API key in `SEATS_AERO_API_KEY` or `~/.config/seats-aero/api_key`, python3, and network access to
-`seats.aero`. If the script exits with code 2 or 3, point the user at that README section rather than improvising.
+Prerequisites the user must already have: a seats.aero Pro membership, a Partner API key in
+`SEATS_AERO_API_KEY` or `~/.config/seats-aero/api_key`, python3, and network access to `seats.aero`. If the
+script exits with code 2 or 3, walk the user through the matching row of the troubleshooting table in
+`SETUP.md` rather than improvising; that file is the complete onboarding guide for a new person.
 
 ## 2. Run the search
 

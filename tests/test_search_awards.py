@@ -489,14 +489,23 @@ class RenderingTests(unittest.TestCase):
 
     def test_markdown_table_contains_key_columns(self):
         text = sa.render_markdown(self.result)
-        self.assertIn("| Program | Cabin | Airline | Flights | Date | Route |", text)
-        self.assertIn("| SIN-LHR |", text)
+        self.assertIn("| # | Program | Cabin | Airline | Flights | Dep → Arr |", text)   # single day, single pair: no Date/Route
+        self.assertNotIn("| SIN-LHR |", text)
         self.assertIn("Air Canada Aeroplan", text)
         self.assertIn("Singapore Airlines (SQ)", text)
         self.assertIn("87,500", text)
         self.assertIn("147.50 CAD", text)
         self.assertIn("[book](https://www.aircanada.com/", text)
         self.assertIn("Passengers: 2", text)
+
+    def test_date_and_route_columns_appear_when_they_carry_information(self):
+        client, _, _ = make_client(default_routes())
+        result = sa.run_search(client, query(destination="LHR,LGW", start_date=date(2026, 11, 11), end_date=date(2026, 11, 17)))
+        text = sa.render_markdown(result)
+        self.assertIn("| Flights | Date | Route | Dep → Arr |", text)
+        self.assertIn("| 2026-11-14 | SIN-LHR |", text)
+        html = sa.render_html(result)
+        self.assertIn("<th>Date</th><th>Route</th>", html)
 
     def test_markdown_overnight_arrival_marker(self):
         text = sa.render_markdown(self.result)
@@ -512,11 +521,18 @@ class RenderingTests(unittest.TestCase):
         for key in ("program", "cabin", "airlines", "flight_numbers", "mileage_cost", "taxes_display", "booking_link", "seats_known"):
             self.assertIn(key, option)
 
-    def test_no_results_message(self):
-        empty = sa.SearchResult(query=query(), options=[], notes=[], api_calls=1, availabilities_seen=5, generated_at="")
-        text = sa.render_markdown(empty)
-        self.assertIn("No business or first class award space", text)
+    def test_no_results_message_distinguishes_causes(self):
+        economy_only = sa.SearchResult(query=query(), options=[], notes=[], api_calls=1, availabilities_seen=5, generated_at="")
+        text = sa.render_markdown(economy_only)
+        self.assertIn("No business or first class award space found", text)
+        self.assertIn("5 cached records", text)
+        self.assertIn("only economy or premium economy", text)
         self.assertIn("--flex 3", text)
+        nothing = sa.SearchResult(query=query(), options=[], notes=[], api_calls=1, availabilities_seen=0, generated_at="")
+        self.assertIn("any cabin", sa.render_markdown(nothing))
+        far = sa.SearchResult(query=query(start_date=date(2027, 10, 1), end_date=date(2027, 10, 1)), options=[], notes=[], api_calls=1, availabilities_seen=0, generated_at="")
+        self.assertIn("11 months out", far.query.explain_no_results(0, today=date(2026, 9, 12)))
+        self.assertIn("any cabin", sa.render_html(nothing))
 
     def test_formatters(self):
         self.assertEqual(sa.format_duration(870), "14h 30m")
@@ -579,7 +595,7 @@ class HtmlReportTests(unittest.TestCase):
         empty = sa.SearchResult(query=query(), options=[], notes=[], api_calls=1, availabilities_seen=4, generated_at="")
         html = sa.render_html(empty)
         self.assertIn("No business or first class award space", html)
-        self.assertIn("4 availability records", html)
+        self.assertIn("4 cached records", html)
 
     def test_write_report_creates_file_at_default_path(self):
         import tempfile
@@ -602,6 +618,7 @@ class HtmlReportTests(unittest.TestCase):
 
     def test_every_program_has_booking_fallback_and_https_urls(self):
         self.assertEqual(set(sa.PROGRAM_BOOKING_URLS), set(sa.PROGRAM_NAMES))
+        self.assertIn("british", sa.PROGRAM_NAMES)   # seen live in September 2026
         for url in list(sa.PROGRAM_BOOKING_URLS.values()) + list(sa.AIRLINE_URLS.values()):
             self.assertTrue(url.startswith("https://"), url)
         self.assertEqual(set(sa.AIRLINE_URLS), set(sa.AIRLINE_NAMES))

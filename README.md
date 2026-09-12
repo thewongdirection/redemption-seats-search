@@ -10,6 +10,9 @@ program's booking page for that itinerary, and prints a markdown summary in the 
 
 Economy and premium economy are deliberately out of scope.
 
+**New here?** [SETUP.md](SETUP.md) walks you step by step from a seats.aero account to a working search on your
+own Claude account, for both Claude Code on your computer and Claude Code on the web.
+
 ## What you need to provide
 
 ### One-time setup
@@ -140,7 +143,7 @@ drive a seats.aero MCP server.
 ## Development
 
 ```bash
-./run_tests.sh              # 66 offline unit tests, network mocked
+./run_tests.sh              # 68 offline unit tests, network mocked
 ./scripts/check_secrets.sh  # credential scan
 ```
 
@@ -148,6 +151,8 @@ drive a seats.aero MCP server.
 
 ```
 SKILL.md                     skill instructions Claude reads
+SETUP.md                     step-by-step onboarding for a new user
+CLAUDE.md                    points Claude at SKILL.md in web sessions on this repo
 scripts/search_awards.py     the search tool
 scripts/check_secrets.sh     credential scanner
 references/                  API notes and MCP alternative
