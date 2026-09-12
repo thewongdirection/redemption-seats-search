@@ -17,13 +17,15 @@ result so the user can act on it.
 |---|---|---|
 | Origin airport | yes | 3-letter IATA code. For a city with several airports pass them together, e.g. `PEK,PKX` for Beijing, `LHR,LGW` for London, `JFK,EWR` for New York (up to 4 per side). |
 | Destination airport | yes | Same rules. |
-| Date flying | yes | `YYYY-MM-DD`. If the user gives "14 Nov", assume the next occurrence and confirm the year in your reply. |
+| Date flying | no | `YYYY-MM-DD`. If the user gives "14 Nov", assume the next occurrence and confirm the year in your reply. **If the user gives no date at all, omit `--date`**: the script scans 354–355 days out, the schedule-opening window where airlines first release award seats. Say that is what you did. |
 | Passengers | yes | 1–9. Default to 1 only if the user clearly means themselves alone. |
 | Flexibility | optional | `--flex N` searches ±N days. Offer it when a date returns nothing. |
 | Cabin | optional | Default is business **and** first. Use `--cabins first` when the user only wants first. Economy and premium economy are out of scope; the script refuses them. |
 | Nonstop only | optional | `--direct-only`. |
+| Refresh stale data | optional | `--refresh` asks seats.aero to re-scrape matching records older than 24h (tune with `--refresh-older-than HOURS`) and waits up to 120s before reporting. Pro keys only; each refreshed record spends one call of the 1,000/day quota. Use it when the user complains about stale results or when the first run shows rows marked stale and the decision matters. |
 
-If origin, destination, date or party size is missing, ask for it in one short message rather than guessing.
+If origin, destination or party size is missing, ask for it in one short message rather than guessing. A missing
+date is not a blocker: run without `--date` and explain the schedule-opening scan.
 
 Prerequisites the user must already have (see README, "What you need to provide"): a seats.aero Pro membership,
 a Partner API key in `SEATS_AERO_API_KEY` or `~/.config/seats-aero/api_key`, python3, and network access to
@@ -42,6 +44,8 @@ python3 scripts/search_awards.py JFK NRT --date 2027-03-02 --pax 1 --cabins firs
 python3 scripts/search_awards.py SIN PEK,PKX --date 2027-09-02 --pax 2          # both Beijing airports
 python3 scripts/search_awards.py LAX SYD --date 2026-12-20 --pax 2 --flex 3 --direct-only
 python3 scripts/search_awards.py SFO CDG --date 2026-10-05 --pax 3 --json   # machine-readable
+python3 scripts/search_awards.py SIN NGO --pax 2                             # no date: 354-355 days out
+python3 scripts/search_awards.py SIN PEK,PKX --date 2026-11-14 --pax 2 --refresh   # re-scrape stale rows first
 ```
 
 Every run produces two things:
@@ -80,7 +84,9 @@ readable without opening the file. Do not rewrite the numbers. Add anything the 
 - **Seat counts.** `?` means the program does not publish a count. Say so plainly and suggest the user verify on
   the program's site before transferring points.
 - **Freshness.** The "Updated" column is the cache age. Anything older than a day should be re-verified; the
-  script also prints a note when this applies. seats.aero Pro keys only see cached data, not live searches.
+  script also prints a note when this applies. Offer `--refresh` for stale rows. If a refresh reports records
+  "skipped because seats.aero has that program's scraping paused", that program (KrisFlyer has been one) cannot
+  be refreshed by anyone right now; the user must check the program's own site. Pro keys never get live search.
 - **Taxes** are per passenger in the program's billing currency. Multiply by party size if the user asks for a total.
 - **Nothing found.** Say so in one line, then offer the concrete next steps: `--flex 3`, alternate airports, or
   checking whether space exists for fewer passengers (`--pax 1`) so they know if it is a party-size problem.

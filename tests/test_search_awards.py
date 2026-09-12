@@ -82,9 +82,22 @@ def default_routes() -> dict[str, object]:
 
 
 def query(**overrides) -> sa.SearchQuery:
-    base = dict(origin="SIN", destination="LHR", travel_date=date(2026, 11, 14), pax=1)
+    base = dict(origin="SIN", destination="LHR", start_date=date(2026, 11, 14), end_date=date(2026, 11, 14), pax=1)
     base.update(overrides)
     return sa.SearchQuery(**base)
+
+
+def refresh_response(items: dict[str, str], complete: bool, remaining: int = 900) -> dict:
+    return {
+        "items": [{"availability_id": k, "status": v, "updated_at": "2026-09-12T00:00:00Z"} for k, v in items.items()],
+        "queued": sum(1 for v in items.values() if v == "queued"),
+        "refunded": 0,
+        "counts": {"processing": sum(1 for v in items.values() if v in ("queued", "processing")),
+                   "succeeded": sum(1 for v in items.values() if v == "succeeded"),
+                   "failed": sum(1 for v in items.values() if v == "failed")},
+        "complete": complete,
+        "quota": {"limit": 1000, "used": 1000 - remaining, "remaining": remaining, "reset_seconds": 40000},
+    }
 
 
 # --------------------------------------------------------------------------- filtering
@@ -213,6 +226,109 @@ class TripEnrichmentTests(unittest.TestCase):
         self.assertTrue(any("older than" in n for n in result.notes))
 
 
+# --------------------------------------------------------------------------- refresh
+
+
+class RefreshTests(unittest.TestCase):
+    def test_refresh_posts_json_and_polls_until_complete(self):
+        responses = iter([
+            refresh_response({"a": "queued", "b": "queued"}, complete=False),
+            refresh_response({"a": "processing", "b": "succeeded"}, complete=False),
+            refresh_response({"a": "succeeded", "b": "succeeded"}, complete=True, remaining=850),
+        ])
+        client, opener, sleeps = make_client({"refresh": lambda: next(responses)})
+        outcome = client.refresh_and_wait(["a", "b", "a"], timeout_seconds=60, poll_seconds=5)
+        self.assertEqual(outcome.requested, 2)
+        self.assertEqual(outcome.succeeded, 2)
+        self.assertFalse(outcome.timed_out)
+        self.assertEqual(sleeps, [5, 5])
+        self.assertEqual(outcome.quota["remaining"], 850)
+        self.assertIn("2 refreshed", outcome.summary())
+        self.assertIn("850/1000", outcome.summary())
+
+    def test_refresh_request_body_shape(self):
+        captured = {}
+        def handler():
+            return refresh_response({"x": "succeeded"}, complete=True)
+        opener = FakeOpener({"refresh": handler})
+        original = opener.__call__
+        def spy(request, timeout):
+            captured["method"] = request.get_method()
+            captured["body"] = json.loads(request.data.decode())
+            captured["ctype"] = request.get_header("Content-type")
+            return original(request, timeout)
+        client = sa.SeatsAeroClient("k", opener=spy, sleep=lambda _: None)
+        client.refresh(["x"])
+        self.assertEqual(captured, {"method": "POST", "body": {"availability_ids": ["x"]}, "ctype": "application/json"})
+
+    def test_refresh_times_out_and_reports_processing(self):
+        client, _, sleeps = make_client({"refresh": lambda: refresh_response({"a": "processing"}, complete=False)})
+        outcome = client.refresh_and_wait(["a"], timeout_seconds=12, poll_seconds=5)
+        self.assertTrue(outcome.timed_out)
+        self.assertEqual(outcome.processing, 1)
+        self.assertEqual(len(sleeps), 3)
+        self.assertIn("still processing", outcome.summary())
+
+    def test_refresh_batches_by_250(self):
+        calls = []
+        def handler():
+            calls.append(1)
+            return refresh_response({}, complete=True)
+        client, _, _ = make_client({"refresh": handler})
+        client.refresh_and_wait([f"id{i}" for i in range(501)], timeout_seconds=0)
+        self.assertEqual(len(calls), 3)
+
+    def test_skipped_outage_is_explained(self):
+        client, _, _ = make_client({"refresh": lambda: refresh_response({"a": "skipped_outage", "b": "succeeded"}, complete=True)})
+        outcome = client.refresh_and_wait(["a", "b"])
+        self.assertEqual(outcome.skipped, 1)
+        self.assertIn("scraping paused", outcome.summary())
+
+    def test_run_search_refreshes_only_stale_records_and_researches(self):
+        search_calls = []
+        refreshed = []
+        def search_handler():
+            search_calls.append(1)
+            return load_fixture("search_response.json")
+        opener_routes = default_routes()
+        opener_routes["search"] = search_handler
+        def refresh_handler():
+            return refresh_response({"avail-qantas-first": "succeeded"}, complete=True)
+        opener_routes["refresh"] = refresh_handler
+        opener = FakeOpener(opener_routes)
+        client = sa.SeatsAeroClient("k", opener=opener, sleep=lambda _: None)
+        result = sa.run_search(client, query(refresh=True))
+        refresh_bodies = [u for u in opener.requests if u.endswith("/refresh")]
+        self.assertEqual(len(refresh_bodies), 1)          # aeroplan/united records are "fresh" (2099) so only qantas (2020) is stale
+        self.assertEqual(len(search_calls), 2)            # searched again after the refresh
+        self.assertIsNotNone(result.refresh)
+        self.assertEqual(result.refresh.requested, 1)
+        self.assertTrue(any("1 refreshed" in n for n in result.notes))
+        payload = json.loads(sa.render_json(result))
+        self.assertEqual(payload["refresh"]["succeeded"], 1)
+        self.assertIn("Refresh requested", sa.render_markdown(result))
+
+    def test_run_search_refresh_with_nothing_stale_adds_note_only(self):
+        routes = default_routes()
+        client, opener, _ = make_client(routes)
+        result = sa.run_search(client, query(refresh=True, refresh_older_than_hours=10**7))
+        self.assertFalse(any(u.endswith("/refresh") for u in opener.requests))
+        self.assertTrue(any("already newer" in n for n in result.notes))
+
+    def test_run_search_survives_refresh_failure(self):
+        routes = default_routes()
+        routes["refresh"] = lambda: http_error("x", 403, "not allowed")
+        client, _, _ = make_client(routes)
+        result = sa.run_search(client, query(refresh=True))
+        self.assertTrue(any("Refresh was not possible" in n for n in result.notes))
+        self.assertGreater(len(result.options), 0)
+
+    def test_schedule_opening_note(self):
+        client, _, _ = make_client(default_routes())
+        result = sa.run_search(client, query(date_mode="schedule-opening", start_date=date(2027, 9, 1), end_date=date(2027, 9, 2)))
+        self.assertTrue(any("354-355 days out" in n for n in result.notes))
+
+
 # --------------------------------------------------------------------------- http client
 
 
@@ -298,6 +414,26 @@ class ArgumentValidationTests(unittest.TestCase):
         self.assertEqual((q.origin, q.destination, q.pax), ("SIN", "LHR", 2))
         self.assertEqual((q.start_date, q.end_date), (date(2026, 11, 12), date(2026, 11, 16)))
         self.assertEqual(q.cabins, ("business", "first"))
+        self.assertEqual(q.date_mode, "flex")
+        self.assertFalse(q.refresh)
+
+    def test_no_date_scans_schedule_opening_window(self):
+        q, _ = self.parse("SIN", "LHR", "--pax", "2")
+        self.assertEqual((q.start_date, q.end_date), (date(2027, 9, 1), date(2027, 9, 2)))
+        self.assertEqual(q.date_mode, "schedule-opening")
+        self.assertEqual(q.window_label, "2027-09-01 to 2027-09-02")
+        self.assertEqual(sa.default_report_path(q).name, "awards_SIN-LHR_2027-09-01_to_2027-09-02_pax2.html")
+
+    def test_flex_without_date_is_rejected(self):
+        with self.assertRaises(sa.UsageError):
+            self.parse("SIN", "LHR", "--flex", "2")
+
+    def test_refresh_flags_are_parsed(self):
+        q, _ = self.parse("SIN", "LHR", "--date", "2026-11-14", "--refresh", "--refresh-older-than", "6", "--refresh-timeout", "30")
+        self.assertTrue(q.refresh)
+        self.assertEqual((q.refresh_older_than_hours, q.refresh_timeout_seconds), (6.0, 30.0))
+        with self.assertRaises(sa.UsageError):
+            self.parse("SIN", "LHR", "--date", "2026-11-14", "--refresh-older-than", "-1")
 
     def test_rejects_bad_airport(self):
         with self.assertRaises(sa.UsageError):
@@ -311,6 +447,7 @@ class ArgumentValidationTests(unittest.TestCase):
         q, _ = self.parse("sin", "pek, pkx,PEK", "--date", "2027-09-02", "--pax", "2")
         self.assertEqual((q.origin, q.destination), ("SIN", "PEK,PKX"))
         self.assertEqual(q.destination_label, "PEK/PKX")
+        self.assertEqual(q.date_mode, "exact")
         self.assertEqual(sa.default_report_path(q).name, "awards_SIN-PEK+PKX_2027-09-02_pax2.html")
 
     def test_rejects_overlapping_or_too_many_airports(self):
@@ -368,7 +505,8 @@ class RenderingTests(unittest.TestCase):
     def test_json_output_is_valid_and_complete(self):
         payload = json.loads(sa.render_json(self.result))
         self.assertEqual(payload["query"]["origin"], "SIN")
-        self.assertEqual(payload["query"]["travel_date"], "2026-11-14")
+        self.assertEqual(payload["query"]["start_date"], "2026-11-14")
+        self.assertIsNone(payload["refresh"])
         self.assertGreater(len(payload["options"]), 0)
         option = payload["options"][0]
         for key in ("program", "cabin", "airlines", "flight_numbers", "mileage_cost", "taxes_display", "booking_link", "seats_known"):
@@ -446,8 +584,8 @@ class HtmlReportTests(unittest.TestCase):
     def test_write_report_creates_file_at_default_path(self):
         import tempfile
         with tempfile.TemporaryDirectory() as tmp:
-            path = sa.default_report_path(query(pax=2, flex_days=3), Path(tmp))
-            self.assertEqual(path.name, "awards_SIN-LHR_2026-11-14_pm3d_pax2.html")
+            path = sa.default_report_path(query(pax=2, start_date=date(2026, 11, 11), end_date=date(2026, 11, 17)), Path(tmp))
+            self.assertEqual(path.name, "awards_SIN-LHR_2026-11-11_to_2026-11-17_pax2.html")
             sa.write_report(self.result, path)
             self.assertTrue(path.is_file())
             self.assertIn("Air Canada Aeroplan", path.read_text(encoding="utf-8"))

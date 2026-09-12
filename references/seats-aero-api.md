@@ -64,12 +64,27 @@ Times are airport-local wall-clock values serialised with a `Z` suffix; do not c
 `TotalTaxes` is in the currency's minor unit (14750 CAD → $147.50). If a program ever reports a zero-decimal
 currency differently, adjust `format_taxes` in the script and add a test.
 
+### POST `/refresh` — Refresh Cached Data (used by `--refresh`)
+
+Body: `{"availability_ids": ["…", …]}` with 1–250 IDs. Pro keys only; commercial keys are refused.
+Posting the same IDs again polls without re-queuing or spending quota. Observed live response:
+
+```json
+{"items":[{"availability_id":"…","status":"queued","updated_at":"2026-08-31T02:13:12Z"}],
+ "queued":1,"refunded":0,"counts":{"processing":1,"succeeded":0,"failed":0},"complete":false,
+ "quota":{"limit":1000,"used":61,"remaining":939,"reset_seconds":45069}}
+```
+
+Statuses seen: `queued` → `processing` → `succeeded` (about 15 s for Aeroplan), plus `failed` and
+`skipped_outage` (seats.aero has that program's scraping paused; KrisFlyer returned this in September 2026).
+`quota` is the shared daily API allowance; each queued ID counts as one call. An empty ID list returns
+HTTP 400 `no_availability_ids`.
+
 ### Not used, for reference
 
 - GET `/availability?source=…` — bulk dump for one program (region filters, pagination).
 - GET `/routes?source=…` — routes a program is monitored on.
 - GET `/destinations?origin_airport=…` — nonstop destinations with cheapest miles per cabin.
-- POST `/refresh` `{availability_ids:[…]}` — queue a re-scrape (Pro only).
 - POST `/live` — real-time search with `seat_count`; commercial keys only.
 
 ## Program (`Source`) codes

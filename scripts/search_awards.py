@@ -45,6 +45,13 @@ CABIN_CODES = {"business": "J", "first": "F"}
 DEFAULT_CABINS = ("business", "first")
 
 MAX_PAGES = 20            # safety cap on cached-search pagination
+REFRESH_BATCH = 250        # seats.aero accepts at most 250 availability IDs per refresh request
+REFRESH_POLL_SECONDS = 5.0
+DEFAULT_REFRESH_OLDER_THAN_HOURS = 24.0
+DEFAULT_REFRESH_TIMEOUT_SECONDS = 120.0
+# With no --date, scan the far edge of the booking window: most airlines load award
+# inventory 354-355 days ahead, so this is where fresh premium space first appears.
+SCHEDULE_OPENING_DAYS = (354, 355)
 DEFAULT_TRIP_LOOKUPS = 40  # cap on /trips/{id} calls per run (Pro keys get ~1000 calls/day)
 STALE_AFTER_HOURS = 24     # flag cached availability older than this
 
@@ -226,14 +233,22 @@ class SeatsAeroClient:
     # -- low level
 
     def get(self, path: str, params: dict[str, Any] | None = None) -> dict[str, Any]:
+        return self._request(path, params=params)
+
+    def post(self, path: str, body: dict[str, Any]) -> dict[str, Any]:
+        return self._request(path, body=body)
+
+    def _request(self, path: str, params: dict[str, Any] | None = None, body: dict[str, Any] | None = None) -> dict[str, Any]:
         query = {k: _param_value(v) for k, v in (params or {}).items() if v is not None}
         url = f"{self._base_url}/{path.lstrip('/')}"
         if query:
             url += "?" + urllib.parse.urlencode(query)
-        request = urllib.request.Request(
-            url,
-            headers={"accept": "application/json", "Partner-Authorization": self._api_key},
-        )
+        headers = {"accept": "application/json", "Partner-Authorization": self._api_key}
+        data = None
+        if body is not None:
+            headers["content-type"] = "application/json"
+            data = json.dumps(body).encode("utf-8")
+        request = urllib.request.Request(url, data=data, headers=headers, method="POST" if body is not None else "GET")
         for attempt in range(self._max_retries + 1):
             try:
                 self.calls_made += 1
@@ -291,6 +306,110 @@ class SeatsAeroClient:
     def trips(self, availability_id: str) -> dict[str, Any]:
         """Flight-level detail (segments, taxes, booking links) for one Availability."""
         return self.get(f"trips/{urllib.parse.quote(availability_id, safe='')}")
+
+    def refresh(self, availability_ids: Sequence[str]) -> dict[str, Any]:
+        """Queue (or poll) a re-scrape of up to 250 Availability objects. Pro keys only.
+
+        The same call both queues and polls: re-posting IDs that are already processing
+        does not re-queue them or spend quota. Response shape observed live:
+          {"items":[{"availability_id","status","updated_at"}], "queued", "refunded",
+           "counts":{"processing","succeeded","failed"}, "complete": bool,
+           "quota":{"limit","used","remaining","reset_seconds"}}
+        Statuses seen: queued, processing, succeeded, failed, skipped_outage.
+        """
+        return self.post("refresh", {"availability_ids": list(availability_ids)})
+
+    def refresh_and_wait(
+        self,
+        availability_ids: Sequence[str],
+        *,
+        timeout_seconds: float = DEFAULT_REFRESH_TIMEOUT_SECONDS,
+        poll_seconds: float = REFRESH_POLL_SECONDS,
+        log: Callable[[str], None] = lambda _: None,
+    ) -> "RefreshOutcome":
+        """Queue refreshes in batches and poll until every batch reports complete or time runs out."""
+        ids = list(dict.fromkeys(availability_ids))
+        batches = [ids[i:i + REFRESH_BATCH] for i in range(0, len(ids), REFRESH_BATCH)]
+        outcome = RefreshOutcome(requested=len(ids))
+        pending = []
+        for batch in batches:
+            response = self.refresh(batch)
+            outcome.absorb(response)
+            if not response.get("complete"):
+                pending.append(batch)
+        waited = 0.0
+        while pending and waited < timeout_seconds:
+            self._sleep(poll_seconds)
+            waited += poll_seconds
+            still_pending = []
+            for batch in pending:
+                response = self.refresh(batch)
+                outcome.absorb(response)
+                if not response.get("complete"):
+                    still_pending.append(batch)
+            pending = still_pending
+            log(f"refresh: {outcome.succeeded} done, {outcome.processing} in progress after {waited:.0f}s")
+        outcome.timed_out = bool(pending)
+        outcome.waited_seconds = waited
+        return outcome
+
+
+@dataclass
+class RefreshOutcome:
+    """Aggregated result of one or more /refresh calls."""
+
+    requested: int = 0
+    statuses: dict[str, str] = field(default_factory=dict)
+    quota: dict[str, Any] = field(default_factory=dict)
+    timed_out: bool = False
+    waited_seconds: float = 0.0
+
+    def absorb(self, response: dict[str, Any]) -> None:
+        for item in response.get("items") or []:
+            if item.get("availability_id"):
+                self.statuses[str(item["availability_id"])] = str(item.get("status", ""))
+        if response.get("quota"):
+            self.quota = dict(response["quota"])
+
+    def count(self, *statuses: str) -> int:
+        return sum(1 for s in self.statuses.values() if s in statuses)
+
+    @property
+    def succeeded(self) -> int:
+        return self.count("succeeded")
+
+    @property
+    def failed(self) -> int:
+        return self.count("failed")
+
+    @property
+    def processing(self) -> int:
+        return self.count("queued", "processing")
+
+    @property
+    def skipped(self) -> int:
+        return sum(1 for s in self.statuses.values() if s.startswith("skipped"))
+
+    def summary(self) -> str:
+        parts = [f"{self.succeeded} refreshed"]
+        if self.skipped:
+            outage = self.count("skipped_outage")
+            parts.append(f"{self.skipped} skipped" + (f" ({outage} because seats.aero has that program's scraping paused)" if outage else ""))
+        if self.failed:
+            parts.append(f"{self.failed} failed")
+        if self.processing:
+            parts.append(f"{self.processing} still processing when the wait timed out")
+        text = f"Refresh of {self.requested} stale record{'s' if self.requested != 1 else ''}: " + ", ".join(parts) + "."
+        if self.quota:
+            text += f" Daily API quota: {self.quota.get('remaining')}/{self.quota.get('limit')} calls remaining."
+        return text
+
+    def to_json(self) -> dict[str, Any]:
+        return {
+            "requested": self.requested, "succeeded": self.succeeded, "skipped": self.skipped, "failed": self.failed,
+            "still_processing": self.processing, "timed_out": self.timed_out, "waited_seconds": self.waited_seconds,
+            "statuses": self.statuses, "quota": self.quota,
+        }
 
 
 def _param_value(value: Any) -> str:
@@ -353,21 +472,27 @@ class AwardOption:
 class SearchQuery:
     origin: str          # one or more IATA codes joined with commas, e.g. "SIN" or "PEK,PKX"
     destination: str
-    travel_date: date
+    start_date: date
+    end_date: date
     pax: int
     cabins: tuple[str, ...] = DEFAULT_CABINS
-    flex_days: int = 0
     direct_only: bool = False
     sources: tuple[str, ...] = ()
     max_trip_lookups: int = DEFAULT_TRIP_LOOKUPS
+    date_mode: str = "exact"           # exact | flex | schedule-opening
+    refresh: bool = False
+    refresh_older_than_hours: float = DEFAULT_REFRESH_OLDER_THAN_HOURS
+    refresh_timeout_seconds: float = DEFAULT_REFRESH_TIMEOUT_SECONDS
 
     @property
-    def start_date(self) -> date:
-        return self.travel_date - timedelta(days=self.flex_days)
+    def single_day(self) -> bool:
+        return self.start_date == self.end_date
 
     @property
-    def end_date(self) -> date:
-        return self.travel_date + timedelta(days=self.flex_days)
+    def window_label(self) -> str:
+        if self.single_day:
+            return self.start_date.isoformat()
+        return f"{self.start_date} to {self.end_date}"
 
     @property
     def origin_label(self) -> str:
@@ -386,6 +511,7 @@ class SearchResult:
     api_calls: int
     availabilities_seen: int
     generated_at: str
+    refresh: RefreshOutcome | None = None
 
 
 def premium_cabins_available(availability: dict[str, Any], cabins: Sequence[str]) -> list[str]:
@@ -393,17 +519,43 @@ def premium_cabins_available(availability: dict[str, Any], cabins: Sequence[str]
     return [cabin for cabin in cabins if availability.get(f"{CABIN_CODES[cabin]}Available")]
 
 
+def _fetch_candidates(client: SeatsAeroClient, query: SearchQuery, log: Callable[[str], None]) -> tuple[int, list[dict[str, Any]]]:
+    log(f"Searching seats.aero cache: {query.origin}->{query.destination} {query.start_date}..{query.end_date}")
+    availabilities = list(client.search(query.origin, query.destination, query.start_date, query.end_date, sources=query.sources or None))
+    candidates = [a for a in availabilities if premium_cabins_available(a, query.cabins)]
+    candidates.sort(key=lambda a: (a.get("Date", ""), _cheapest_premium_cost(a, query.cabins)))
+    log(f"{len(availabilities)} availability records, {len(candidates)} with {'/'.join(query.cabins)} space")
+    return len(availabilities), candidates
+
+
+def _refresh_stale(client: SeatsAeroClient, candidates: list[dict[str, Any]], query: SearchQuery, log: Callable[[str], None]) -> RefreshOutcome | None:
+    stale_ids = [a["ID"] for a in candidates if _hours_since(str(a.get("UpdatedAt") or "")) > query.refresh_older_than_hours]
+    if not stale_ids:
+        log(f"refresh: nothing older than {query.refresh_older_than_hours:g}h to refresh")
+        return None
+    log(f"refresh: asking seats.aero to re-scrape {len(stale_ids)} record(s) older than {query.refresh_older_than_hours:g}h")
+    return client.refresh_and_wait(stale_ids, timeout_seconds=query.refresh_timeout_seconds, log=log)
+
+
 def run_search(client: SeatsAeroClient, query: SearchQuery, log: Callable[[str], None] = lambda _: None) -> SearchResult:
     notes: list[str] = []
     options: list[AwardOption] = []
     lookups = 0
 
-    log(f"Searching seats.aero cache: {query.origin}->{query.destination} {query.start_date}..{query.end_date}")
-    availabilities = list(client.search(query.origin, query.destination, query.start_date, query.end_date, sources=query.sources or None))
-    seen = len(availabilities)
-    candidates = [a for a in availabilities if premium_cabins_available(a, query.cabins)]
-    candidates.sort(key=lambda a: (a.get("Date", ""), _cheapest_premium_cost(a, query.cabins)))
-    log(f"{seen} availability records, {len(candidates)} with {'/'.join(query.cabins)} space")
+    seen, candidates = _fetch_candidates(client, query, log)
+    refresh_outcome: RefreshOutcome | None = None
+    if query.refresh:
+        try:
+            refresh_outcome = _refresh_stale(client, candidates, query, log)
+        except SeatsAeroError as err:
+            notes.append(f"Refresh was not possible ({err}); showing cached data as-is.")
+        else:
+            if refresh_outcome is None:
+                notes.append(f"Refresh requested, but every matching record was already newer than {query.refresh_older_than_hours:g}h.")
+            else:
+                notes.append(refresh_outcome.summary())
+                if refresh_outcome.succeeded or refresh_outcome.processing:
+                    seen, candidates = _fetch_candidates(client, query, log)
 
     for availability in candidates:
         cabins_open = premium_cabins_available(availability, query.cabins)
@@ -437,6 +589,8 @@ def run_search(client: SeatsAeroClient, query: SearchQuery, log: Callable[[str],
         notes.append(f"Some results are cached data older than {STALE_AFTER_HOURS}h (see Updated column); re-verify on the program's site before transferring points.")
     if query.pax > 1:
         notes.append(f"Filtered to itineraries reporting at least {query.pax} seats; programs that hide seat counts are kept and flagged.")
+    if query.date_mode == "schedule-opening":
+        notes.append(f"No date was given, so this scanned {SCHEDULE_OPENING_DAYS[0]}-{SCHEDULE_OPENING_DAYS[1]} days out, where airlines first release award inventory.")
 
     options.sort(key=lambda o: (o.mileage_cost or 10**9, o.taxes_minor_units, o.departs_at))
     return SearchResult(
@@ -446,6 +600,7 @@ def run_search(client: SeatsAeroClient, query: SearchQuery, log: Callable[[str],
         api_calls=client.calls_made,
         availabilities_seen=seen,
         generated_at=datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        refresh=refresh_outcome,
     )
 
 
@@ -489,7 +644,7 @@ def _trip_options(availability: dict[str, Any], payload: dict[str, Any], query: 
                 program=PROGRAM_NAMES.get(source, source),
                 source=source,
                 cabin=cabin,
-                travel_date=str(availability.get("Date", query.travel_date.isoformat())),
+                travel_date=str(availability.get("Date", query.start_date.isoformat())),
                 route=route,
                 airlines=_unique(_split_codes(trip.get("Carriers"))),
                 flight_numbers=_normalise_flight_numbers(trip.get("FlightNumbers")),
@@ -525,7 +680,7 @@ def _summary_options(availability: dict[str, Any], cabins_open: Sequence[str], q
                 program=PROGRAM_NAMES.get(source, source),
                 source=source,
                 cabin=cabin,
-                travel_date=str(availability.get("Date", query.travel_date.isoformat())),
+                travel_date=str(availability.get("Date", query.start_date.isoformat())),
                 route=_route_label(availability, query),
                 airlines=_unique(_split_codes(availability.get(f"{code}Airlines"))),
                 flight_numbers=reason or "see program site",
@@ -684,9 +839,9 @@ def airline_url(code: str) -> str:
 
 
 def default_report_path(query: SearchQuery, report_dir: Path = DEFAULT_REPORT_DIR) -> Path:
-    name = f"awards_{query.origin.replace(',', '+')}-{query.destination.replace(',', '+')}_{query.travel_date.isoformat()}"
-    if query.flex_days:
-        name += f"_pm{query.flex_days}d"
+    name = f"awards_{query.origin.replace(',', '+')}-{query.destination.replace(',', '+')}_{query.start_date.isoformat()}"
+    if not query.single_day:
+        name += f"_to_{query.end_date.isoformat()}"
     return report_dir / f"{name}_pax{query.pax}.html"
 
 
@@ -701,11 +856,10 @@ def write_report(result: SearchResult, path: Path) -> Path:
 
 def render_markdown(result: SearchResult, report_path: Path | None = None) -> str:
     q = result.query
-    window = q.travel_date.isoformat() if q.flex_days == 0 else f"{q.start_date} to {q.end_date}"
     lines = [
         f"## Premium-cabin award seats {q.origin_label} → {q.destination_label}",
-        f"Date: {window} · Passengers: {q.pax} · Cabins: {', '.join(c.title() for c in q.cabins)}"
-        + (" · Nonstop only" if q.direct_only else ""),
+        f"{'Date' if q.single_day else 'Dates'}: {q.window_label} · Passengers: {q.pax} · Cabins: {', '.join(c.title() for c in q.cabins)}"
+        + (" · Nonstop only" if q.direct_only else "") + (" · Refresh requested" if q.refresh else ""),
         "",
     ]
     if not result.options:
@@ -714,6 +868,10 @@ def render_markdown(result: SearchResult, report_path: Path | None = None) -> st
             f"({result.availabilities_seen} availability records checked)."
         )
         lines.append("Try `--flex 3` for nearby dates, alternate airports, or a single passenger to see if space exists for fewer seats.")
+        if result.notes:
+            lines.append("")
+            lines.append("Notes:")
+            lines += [f"- {n}" for n in result.notes]
         if report_path is not None:
             lines.append(f"\n_HTML report: {report_path}_")
         return "\n".join(lines)
@@ -746,10 +904,10 @@ def render_json(result: SearchResult, report_path: Path | None = None) -> str:
     payload = {
         "query": {
             **asdict(result.query),
-            "travel_date": result.query.travel_date.isoformat(),
             "start_date": result.query.start_date.isoformat(),
             "end_date": result.query.end_date.isoformat(),
         },
+        "refresh": result.refresh.to_json() if result.refresh else None,
         "generated_at": result.generated_at,
         "api_calls": result.api_calls,
         "availabilities_seen": result.availabilities_seen,
@@ -895,13 +1053,16 @@ def _html_row(idx: int, o: AwardOption) -> str:
 
 def render_html(result: SearchResult) -> str:
     q = result.query
-    window = q.travel_date.isoformat() if q.flex_days == 0 else f"{q.start_date} → {q.end_date}"
-    title = f"Award seats {q.origin_label} → {q.destination_label} · {window}"
+    title = f"Award seats {q.origin_label} → {q.destination_label} · {q.window_label}"
     chips = [
-        ("Date", window), ("Passengers", str(q.pax)), ("Cabins", ", ".join(c.title() for c in q.cabins)),
+        ("Date" if q.single_day else "Dates", q.window_label), ("Passengers", str(q.pax)), ("Cabins", ", ".join(c.title() for c in q.cabins)),
     ]
     if q.direct_only:
         chips.append(("Routing", "Nonstop only"))
+    if q.refresh:
+        chips.append(("Refresh", "requested for records older than %gh" % q.refresh_older_than_hours))
+    if q.date_mode == "schedule-opening":
+        chips.append(("Mode", f"schedule opening, {SCHEDULE_OPENING_DAYS[0]}-{SCHEDULE_OPENING_DAYS[1]} days out"))
     if q.sources:
         chips.append(("Programs", ", ".join(q.sources)))
     chips_html = "".join(f'<span class="chip">{_esc(k)}: <b>{_esc(v)}</b></span>' for k, v in chips)
@@ -948,13 +1109,16 @@ def parse_args(argv: Sequence[str] | None = None, today: date | None = None) -> 
     )
     parser.add_argument("origin", help="Origin airport IATA code(s), e.g. SIN or LHR,LGW")
     parser.add_argument("destination", help="Destination airport IATA code(s), e.g. PEK,PKX")
-    parser.add_argument("--date", required=True, help="Departure date, YYYY-MM-DD")
+    parser.add_argument("--date", default=None, help=f"Departure date, YYYY-MM-DD. Omit to scan {SCHEDULE_OPENING_DAYS[0]}-{SCHEDULE_OPENING_DAYS[1]} days out (schedule opening)")
     parser.add_argument("--pax", type=int, default=1, help="Number of passengers (1-9). Default 1")
     parser.add_argument("--flex", type=int, default=0, metavar="DAYS", help="Also search +/- DAYS around --date (0-7)")
     parser.add_argument("--cabins", default=",".join(DEFAULT_CABINS), help="Comma list from: business,first. Default both")
     parser.add_argument("--direct-only", action="store_true", help="Only nonstop itineraries")
     parser.add_argument("--sources", default="", help="Comma list of seats.aero program codes to restrict to (e.g. aeroplan,united)")
     parser.add_argument("--max-trip-lookups", type=int, default=DEFAULT_TRIP_LOOKUPS, help=f"Cap on per-availability trip detail calls. Default {DEFAULT_TRIP_LOOKUPS}")
+    parser.add_argument("--refresh", action="store_true", help="Ask seats.aero to re-scrape stale matches before reporting (Pro keys; spends daily quota)")
+    parser.add_argument("--refresh-older-than", type=float, default=DEFAULT_REFRESH_OLDER_THAN_HOURS, metavar="HOURS", help=f"With --refresh, only records older than this. Default {DEFAULT_REFRESH_OLDER_THAN_HOURS:g}")
+    parser.add_argument("--refresh-timeout", type=float, default=DEFAULT_REFRESH_TIMEOUT_SECONDS, metavar="SECONDS", help=f"With --refresh, how long to wait for seats.aero. Default {DEFAULT_REFRESH_TIMEOUT_SECONDS:g}")
     parser.add_argument("--json", action="store_true", help="Emit JSON instead of a markdown table")
     parser.add_argument("--html", metavar="PATH", default=None, help=f"Where to write the HTML report. Default {DEFAULT_REPORT_DIR}/awards_<route>_<date>_pax<N>.html")
     parser.add_argument("--no-html", action="store_true", help="Skip writing the HTML report")
@@ -966,19 +1130,31 @@ def parse_args(argv: Sequence[str] | None = None, today: date | None = None) -> 
     destination = _parse_airports(args.destination, "destination")
     if set(origin.split(",")) & set(destination.split(",")):
         raise UsageError("origin and destination airports must not overlap")
-    if not DATE_RE.match(args.date):
-        raise UsageError("--date must be YYYY-MM-DD")
-    try:
-        travel_date = date.fromisoformat(args.date)
-    except ValueError as err:
-        raise UsageError(f"--date is not a real calendar date: {err}") from None
     today = today or date.today()
-    if travel_date < today:
-        raise UsageError(f"--date {travel_date} is in the past (today is {today})")
-    if not 1 <= args.pax <= 9:
-        raise UsageError("--pax must be between 1 and 9")
     if not 0 <= args.flex <= 7:
         raise UsageError("--flex must be between 0 and 7 days")
+    if args.date is None:
+        if args.flex:
+            raise UsageError("--flex needs a --date to be flexible around")
+        start_date = today + timedelta(days=SCHEDULE_OPENING_DAYS[0])
+        end_date = today + timedelta(days=SCHEDULE_OPENING_DAYS[1])
+        date_mode = "schedule-opening"
+    else:
+        if not DATE_RE.match(args.date):
+            raise UsageError("--date must be YYYY-MM-DD")
+        try:
+            travel_date = date.fromisoformat(args.date)
+        except ValueError as err:
+            raise UsageError(f"--date is not a real calendar date: {err}") from None
+        if travel_date < today:
+            raise UsageError(f"--date {travel_date} is in the past (today is {today})")
+        start_date = travel_date - timedelta(days=args.flex)
+        end_date = travel_date + timedelta(days=args.flex)
+        date_mode = "flex" if args.flex else "exact"
+    if not 1 <= args.pax <= 9:
+        raise UsageError("--pax must be between 1 and 9")
+    if args.refresh_older_than < 0 or args.refresh_timeout < 0:
+        raise UsageError("--refresh-older-than and --refresh-timeout must be >= 0")
     cabins = tuple(c.strip().lower() for c in args.cabins.split(",") if c.strip())
     unknown = [c for c in cabins if c not in CABIN_CODES]
     if unknown or not cabins:
@@ -993,13 +1169,17 @@ def parse_args(argv: Sequence[str] | None = None, today: date | None = None) -> 
     query = SearchQuery(
         origin=origin,
         destination=destination,
-        travel_date=travel_date,
+        start_date=start_date,
+        end_date=end_date,
         pax=args.pax,
         cabins=cabins,
-        flex_days=args.flex,
         direct_only=args.direct_only,
         sources=sources,
         max_trip_lookups=args.max_trip_lookups,
+        date_mode=date_mode,
+        refresh=args.refresh,
+        refresh_older_than_hours=args.refresh_older_than,
+        refresh_timeout_seconds=args.refresh_timeout,
     )
     return query, args
 

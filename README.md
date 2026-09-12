@@ -27,15 +27,26 @@ Economy and premium economy are deliberately out of scope.
 |---|---|---|---|
 | Origin airport(s) | 3-letter IATA code, comma-separated for several | `SIN` or `LHR,LGW` | yes |
 | Destination airport(s) | same | `PEK,PKX` | yes |
-| Travel date | `YYYY-MM-DD`, today or later | `2026-11-14` | yes |
+| Travel date | `YYYY-MM-DD`, today or later | `2026-11-14` | no. Omit it to scan 354–355 days out, the window where airlines first release award seats |
 | Passengers | 1–9 | `--pax 2` | no, defaults to 1 |
 | Date flexibility | 0–7 days either side | `--flex 3` | no, defaults to exact date |
 | Cabins | `business`, `first`, or both | `--cabins first` | no, defaults to both |
 | Nonstop only | flag | `--direct-only` | no |
 | Programs | seats.aero program codes | `--sources aeroplan,united` | no, defaults to all |
+| Refresh stale rows | flag, plus `--refresh-older-than HOURS` (24) and `--refresh-timeout SECONDS` (120) | `--refresh` | no |
 
 seats.aero caches roughly 11 months ahead. A date beyond that returns no records at all rather than an error;
 re-run once the date falls inside the window.
+
+### Stale data and `--refresh`
+
+The "Updated" column shows how old seats.aero's cached record is, and rows over 24 hours old are marked stale.
+How often seats.aero re-scrapes each program is up to seats.aero, but Pro accounts can ask for a re-scrape of
+specific records. `--refresh` does that automatically: after the first search it sends every matching business
+or first record older than the threshold to seats.aero's refresh endpoint, polls until they complete (usually
+10 to 30 seconds), then searches again and reports the fresh figures. Each refreshed record spends one call of
+the shared 1,000 per day quota; polling is free. Records for a program whose scraping seats.aero has paused
+come back as "skipped" and cannot be refreshed by anyone until seats.aero restores that program.
 
 ### Claude Code on the web
 
@@ -87,6 +98,8 @@ python3 scripts/search_awards.py SIN LHR --date 2026-11-14 --pax 2
 python3 scripts/search_awards.py SIN PEK,PKX --date 2027-09-02 --pax 2     # multiple airports per side
 python3 scripts/search_awards.py JFK NRT --date 2027-03-02 --cabins first --flex 3
 python3 scripts/search_awards.py LAX SYD --date 2026-12-20 --pax 2 --direct-only --json
+python3 scripts/search_awards.py SIN NGO --pax 2                              # no date: 354-355 days out
+python3 scripts/search_awards.py SIN PEK,PKX --date 2026-11-14 --pax 2 --refresh    # re-scrape stale rows first
 ```
 
 Each run writes `award-reports/awards_SIN-LHR_2026-11-14_pax2.html` (override with `--html PATH`, skip with
@@ -127,7 +140,7 @@ drive a seats.aero MCP server.
 ## Development
 
 ```bash
-./run_tests.sh              # 54 offline unit tests, network mocked
+./run_tests.sh              # 66 offline unit tests, network mocked
 ./scripts/check_secrets.sh  # credential scan
 ```
 
