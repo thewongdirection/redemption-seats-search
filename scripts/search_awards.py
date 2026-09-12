@@ -54,7 +54,7 @@ DEFAULT_REFRESH_TIMEOUT_SECONDS = 120.0
 SCHEDULE_OPENING_DAYS = (354, 355)
 DEFAULT_TRIP_LOOKUPS = 40  # cap on /trips/{id} calls per run (Pro keys get ~1000 calls/day)
 STALE_AFTER_HOURS = 24     # flag cached availability older than this
-CACHE_HORIZON_DAYS = 330   # seats.aero rarely holds data further out than this; used only for messaging
+CACHE_HORIZON_DAYS = 340   # observed live: seats.aero's cache ends 340-355 days out depending on route; messaging only
 
 IATA_RE = re.compile(r"^[A-Z]{3}$")
 MAX_AIRPORTS_PER_SIDE = 4  # e.g. "PEK,PKX" for Beijing or "LHR,LGW" for London
@@ -501,17 +501,16 @@ class SearchQuery:
     def multi_airport(self) -> bool:
         return "," in self.origin or "," in self.destination
 
-    def explain_no_results(self, records_seen: int, today: date | None = None) -> str:
-        """Why the table is empty, in terms the user can act on."""
-        today = today or date.today()
-        if records_seen > 0:
-            return (f"seats.aero has {records_seen} cached record{'s' if records_seen != 1 else ''} for this search, "
-                    "but only economy or premium economy space; no program shows business or first.")
-        if self.start_date > today + timedelta(days=CACHE_HORIZON_DAYS):
-            return ("seats.aero has nothing cached this far ahead: its data usually ends about 11 months out, "
-                    "so re-run once the date is closer.")
-        return ("No program that seats.aero tracks has any award space cached for this route on these dates, in any cabin. "
-                "That usually means the space is genuinely gone, though it can also mean seats.aero does not monitor this pair.")
+    @property
+    def cabins_label(self) -> str:
+        """'business or first', 'business', or 'first' - whatever this search actually asked for."""
+        return " or ".join(self.cabins)
+
+    @property
+    def programs_label(self) -> str:
+        if self.sources:
+            return "the requested program" + ("s" if len(self.sources) > 1 else "") + f" ({', '.join(self.sources)})"
+        return "any program that seats.aero tracks"
 
     @property
     def origin_label(self) -> str:
@@ -531,6 +530,33 @@ class SearchResult:
     availabilities_seen: int
     generated_at: str
     refresh: RefreshOutcome | None = None
+    premium_matches: int = 0          # availability records that reported space in a requested cabin
+    searched_on: date | None = None   # calendar date of the search; horizon messaging is relative to this
+
+    def explain_no_results(self) -> str:
+        """Why the table is empty, in terms the user can act on. Only meaningful when options is empty."""
+        q = self.query
+        if self.premium_matches > 0:
+            filters = []
+            if q.pax > 1:
+                filters.append(f"room for {q.pax} passengers")
+            if q.direct_only:
+                filters.append("a nonstop routing")
+            why = " and ".join(filters) if filters else "a bookable itinerary after seats.aero's dynamic-pricing filter"
+            return (f"{self.premium_matches} cached record{'s' if self.premium_matches != 1 else ''} show {q.cabins_label} class space, "
+                    f"but none has {why}.")
+        if self.availabilities_seen > 0:
+            return (f"seats.aero has {self.availabilities_seen} cached record{'s' if self.availabilities_seen != 1 else ''} for this search, "
+                    f"but none with {q.cabins_label} class space.")
+        searched_on = self.searched_on or date.today()
+        if q.date_mode == "schedule-opening":
+            return (f"seats.aero has not cached {q.origin_label} → {q.destination_label} this far ahead yet; its cache typically "
+                    f"reaches {CACHE_HORIZON_DAYS}-{SCHEDULE_OPENING_DAYS[1]} days out and this route may take a few more days to appear.")
+        if q.start_date > searched_on + timedelta(days=CACHE_HORIZON_DAYS):
+            return (f"seats.aero has nothing cached this far ahead: its data usually ends about {CACHE_HORIZON_DAYS}-{SCHEDULE_OPENING_DAYS[1]} "
+                    "days out, so re-run once the date is closer.")
+        return (f"{q.programs_label[0].upper() + q.programs_label[1:]} has no award space cached for this route on these dates, in any cabin. "
+                "That usually means the space is genuinely gone, though it can also mean seats.aero does not monitor this pair.")
 
 
 def premium_cabins_available(availability: dict[str, Any], cabins: Sequence[str]) -> list[str]:
@@ -612,14 +638,17 @@ def run_search(client: SeatsAeroClient, query: SearchQuery, log: Callable[[str],
         notes.append(f"No date was given, so this scanned {SCHEDULE_OPENING_DAYS[0]}-{SCHEDULE_OPENING_DAYS[1]} days out, where airlines first release award inventory.")
 
     options.sort(key=lambda o: (o.mileage_cost or 10**9, o.taxes_minor_units, o.departs_at))
+    now = datetime.now(timezone.utc)
     return SearchResult(
         query=query,
         options=options,
         notes=notes,
         api_calls=client.calls_made,
         availabilities_seen=seen,
-        generated_at=datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        generated_at=now.isoformat(timespec="seconds"),
         refresh=refresh_outcome,
+        premium_matches=len(candidates),
+        searched_on=now.date(),
     )
 
 
@@ -873,6 +902,93 @@ def write_report(result: SearchResult, path: Path) -> Path:
 # --------------------------------------------------------------------------- output
 
 
+@dataclass(frozen=True)
+class Column:
+    """One report column, rendered by both the markdown and HTML writers from the same definition."""
+
+    header: str
+    markdown: Callable[[int, AwardOption], str]
+    html: Callable[[int, AwardOption], str]
+    css: str = ""
+
+
+def _dep_arr(o: AwardOption) -> str:
+    return f"{format_clock(o.departs_at)} → {format_clock(o.arrives_at, o.departs_at)}" if o.departs_at else "-"
+
+
+def _seats_text(o: AwardOption) -> str:
+    return str(o.remaining_seats) if o.seats_known else "?"
+
+
+def _book_markdown(o: AwardOption) -> str:
+    url = booking_url(o)
+    return f"[book]({url})" if url else "-"
+
+
+def _book_html(o: AwardOption) -> str:
+    url = booking_url(o)
+    if url and safe_url(o.booking_link):
+        return _html_link(url, "Book →", "book")
+    if url:
+        return _html_link(url, "Program site →", "book book-fallback")
+    return "-"
+
+
+def _flights_html(o: AwardOption) -> str:
+    flights = _esc(o.flight_numbers)
+    if o.detail_level == "summary":
+        return f'<span class="badge summary">summary</span> <span class="muted">{flights}</span>'
+    aircraft = ", ".join(a for a in o.aircraft if a)
+    return flights + (f'<div class="muted">{_esc(aircraft)}</div>' if aircraft else "")
+
+
+def _updated_html(o: AwardOption) -> str:
+    text = _esc(format_age(o.updated_at))
+    if o.updated_at and _hours_since(o.updated_at) > STALE_AFTER_HOURS:
+        text += ' <span class="badge stale">stale</span>'
+    return text
+
+
+def table_columns(q: SearchQuery) -> list[Column]:
+    """Date and Route only earn a column when they vary between rows."""
+    cols = [
+        Column("#", lambda i, o: str(i), lambda i, o: str(i), "num"),
+        Column("Program", lambda i, o: o.program, lambda i, o: _esc(o.program), "wrap"),
+        Column("Cabin", lambda i, o: o.cabin.title(), lambda i, o: f'<span class="badge {_esc(o.cabin)}">{_esc(o.cabin.title())}</span>'),
+        Column("Airline", lambda i, o: format_airlines(o.airlines), lambda i, o: _html_airlines(o.airlines), "wrap"),
+        Column("Flights", lambda i, o: o.flight_numbers, lambda i, o: _flights_html(o)),
+    ]
+    if not q.single_day:
+        cols.append(Column("Date", lambda i, o: o.travel_date, lambda i, o: _esc(o.travel_date)))
+    if q.multi_airport:
+        cols.append(Column("Route", lambda i, o: o.route, lambda i, o: _esc(o.route)))
+    cols += [
+        Column("Dep → Arr", lambda i, o: _dep_arr(o), lambda i, o: _esc(_dep_arr(o))),
+        Column("Duration", lambda i, o: format_duration(o.duration_minutes), lambda i, o: _esc(format_duration(o.duration_minutes))),
+        Column("Stops", lambda i, o: format_stops(o.stops), lambda i, o: _esc(format_stops(o.stops))),
+        Column("Seats", lambda i, o: _seats_text(o),
+               lambda i, o: _esc(_seats_text(o)) if o.seats_known else '<span title="Program does not publish seat counts">?</span>', "num"),
+        Column("Miles / pax", lambda i, o: format_miles(o.mileage_cost), lambda i, o: _esc(format_miles(o.mileage_cost)), "num miles"),
+        Column("Taxes / pax", lambda i, o: format_taxes(o.taxes_minor_units, o.taxes_currency),
+               lambda i, o: _esc(format_taxes(o.taxes_minor_units, o.taxes_currency)), "num"),
+        Column("Updated", lambda i, o: format_age(o.updated_at), lambda i, o: _updated_html(o)),
+        Column("Book", lambda i, o: _book_markdown(o), lambda i, o: _book_html(o)),
+    ]
+    return cols
+
+
+def _next_steps_hint(q: SearchQuery) -> str:
+    hints = []
+    if q.date_mode != "flex":
+        hints.append("`--flex 3` for nearby dates")
+    hints.append("a nearby hub or alternate airport")
+    if q.pax > 1:
+        hints.append("`--pax 1` to see whether space exists for a smaller party")
+    if q.direct_only:
+        hints.append("dropping `--direct-only`")
+    return "Try " + ", ".join(hints) + "."
+
+
 def render_markdown(result: SearchResult, report_path: Path | None = None) -> str:
     q = result.query
     lines = [
@@ -882,8 +998,8 @@ def render_markdown(result: SearchResult, report_path: Path | None = None) -> st
         "",
     ]
     if not result.options:
-        lines.append("No business or first class award space found. " + q.explain_no_results(result.availabilities_seen))
-        lines.append("Try `--flex 3` for nearby dates, a nearby hub or alternate airport, or `--pax 1` to see whether space exists for a smaller party.")
+        lines.append(f"No {q.cabins_label} class award space found. " + result.explain_no_results())
+        lines.append(_next_steps_hint(q))
         if result.notes:
             lines.append("")
             lines.append("Notes:")
@@ -892,26 +1008,10 @@ def render_markdown(result: SearchResult, report_path: Path | None = None) -> st
             lines.append(f"\n_HTML report: {report_path}_")
         return "\n".join(lines)
 
-    columns = ["#", "Program", "Cabin", "Airline", "Flights"]
-    if not q.single_day:
-        columns.append("Date")
-    if q.multi_airport:
-        columns.append("Route")
-    columns += ["Dep → Arr", "Duration", "Stops", "Seats", "Miles / pax", "Taxes / pax", "Updated", "Book"]
-    lines += ["| " + " | ".join(columns) + " |", "|" + "---|" * len(columns)]
+    columns = table_columns(q)
+    lines += ["| " + " | ".join(c.header for c in columns) + " |", "|" + "---|" * len(columns)]
     for idx, o in enumerate(result.options, start=1):
-        url = booking_url(o)
-        book = f"[book]({url})" if url else "-"
-        dep_arr = f"{format_clock(o.departs_at)} → {format_clock(o.arrives_at, o.departs_at)}" if o.departs_at else "-"
-        seats = str(o.remaining_seats) if o.seats_known else "?"
-        cells = [str(idx), o.program, o.cabin.title(), format_airlines(o.airlines), o.flight_numbers]
-        if not q.single_day:
-            cells.append(o.travel_date)
-        if q.multi_airport:
-            cells.append(o.route)
-        cells += [dep_arr, format_duration(o.duration_minutes), format_stops(o.stops), seats,
-                  format_miles(o.mileage_cost), format_taxes(o.taxes_minor_units, o.taxes_currency), format_age(o.updated_at), book]
-        lines.append("| " + " | ".join(cells) + " |")
+        lines.append("| " + " | ".join(c.markdown(idx, o).replace("|", "/") for c in columns) + " |")
     if result.notes:
         lines.append("")
         lines.append("Notes:")
@@ -934,6 +1034,8 @@ def render_json(result: SearchResult, report_path: Path | None = None) -> str:
         "generated_at": result.generated_at,
         "api_calls": result.api_calls,
         "availabilities_seen": result.availabilities_seen,
+        "premium_matches": result.premium_matches,
+        "searched_on": result.searched_on.isoformat() if result.searched_on else None,
         "notes": result.notes,
         "report_path": str(report_path) if report_path is not None else None,
         "options": [
@@ -1042,37 +1144,18 @@ def _html_summary_cards(result: SearchResult) -> str:
     )
 
 
-def _html_row(idx: int, o: AwardOption, q: SearchQuery) -> str:
-    stale = o.updated_at and _hours_since(o.updated_at) > STALE_AFTER_HOURS
-    seats = str(o.remaining_seats) if o.seats_known else '<span title="Program does not publish seat counts">?</span>'
-    dep_arr = f"{format_clock(o.departs_at)} → {format_clock(o.arrives_at, o.departs_at)}" if o.departs_at else "-"
-    aircraft = ", ".join(a for a in o.aircraft if a)
-    flights = _esc(o.flight_numbers)
-    if o.detail_level == "summary":
-        flights = f'<span class="badge summary">summary</span> <span class="muted">{flights}</span>'
-    elif aircraft:
-        flights += f'<div class="muted">{_esc(aircraft)}</div>'
-    url = booking_url(o)
-    if url and safe_url(o.booking_link):
-        book = _html_link(url, "Book →", "book")
-    elif url:
-        book = _html_link(url, "Program site →", "book book-fallback")
-    else:
-        book = "-"
-    updated = _esc(format_age(o.updated_at))
-    if stale:
-        updated += ' <span class="badge stale">stale</span>'
-    return (
-        f'<tr><td class="num">{idx}</td><td class="wrap">{_esc(o.program)}</td>'
-        f'<td><span class="badge {_esc(o.cabin)}">{_esc(o.cabin.title())}</span></td>'
-        f'<td class="wrap">{_html_airlines(o.airlines)}</td><td>{flights}</td>'
-        + (f"<td>{_esc(o.travel_date)}</td>" if not q.single_day else "")
-        + (f"<td>{_esc(o.route)}</td>" if q.multi_airport else "") +
-        f"<td>{_esc(dep_arr)}</td><td>{_esc(format_duration(o.duration_minutes))}</td><td>{_esc(format_stops(o.stops))}</td>"
-        f'<td class="num">{seats}</td><td class="num miles">{_esc(format_miles(o.mileage_cost))}</td>'
-        f'<td class="num">{_esc(format_taxes(o.taxes_minor_units, o.taxes_currency))}</td>'
-        f"<td>{updated}</td><td>{book}</td></tr>"
+def _html_table(result: SearchResult) -> str:
+    columns = table_columns(result.query)
+    head = "".join(f'<th{_css(c.css)}>{_esc(c.header)}</th>' for c in columns)
+    rows = "".join(
+        "<tr>" + "".join(f"<td{_css(c.css)}>{c.html(idx, o)}</td>" for c in columns) + "</tr>"
+        for idx, o in enumerate(result.options, start=1)
     )
+    return f'<div class="tablewrap"><table><thead><tr>{head}</tr></thead><tbody>{rows}</tbody></table></div>'
+
+
+def _css(css: str) -> str:
+    return f' class="{css}"' if css else ""
 
 
 def render_html(result: SearchResult) -> str:
@@ -1092,22 +1175,12 @@ def render_html(result: SearchResult) -> str:
     chips_html = "".join(f'<span class="chip">{_esc(k)}: <b>{_esc(v)}</b></span>' for k, v in chips)
 
     if result.options:
-        rows = "".join(_html_row(i, o, q) for i, o in enumerate(result.options, start=1))
-        head = '<th>#</th><th class="wrap">Program</th><th>Cabin</th><th class="wrap">Airline</th><th>Flights</th>'
-        if not q.single_day:
-            head += "<th>Date</th>"
-        if q.multi_airport:
-            head += "<th>Route</th>"
-        head += "<th>Dep → Arr</th><th>Duration</th><th>Stops</th><th>Seats</th><th>Miles / pax</th><th>Taxes / pax</th><th>Updated</th><th>Book</th>"
-        body = (
-            f'<div class="cards">{_html_summary_cards(result)}</div>'
-            f'<div class="tablewrap"><table><thead><tr>{head}</tr></thead><tbody>{rows}</tbody></table></div>'
-        )
+        body = f'<div class="cards">{_html_summary_cards(result)}</div>{_html_table(result)}'
     else:
         body = (
-            '<div class="empty"><p><b>No business or first class award space found.</b></p>'
-            f"<p>{_esc(q.explain_no_results(result.availabilities_seen))}</p>"
-            "<p>Try nearby dates (--flex 3), a nearby hub or alternate airport, or a smaller party (--pax 1).</p></div>"
+            f'<div class="empty"><p><b>No {_esc(q.cabins_label)} class award space found.</b></p>'
+            f"<p>{_esc(result.explain_no_results())}</p>"
+            f"<p>{_esc(_next_steps_hint(q).replace('`', ''))}</p></div>"
         )
     notes_html = ""
     if result.notes:
@@ -1118,7 +1191,7 @@ def render_html(result: SearchResult) -> str:
         '<meta name="viewport" content="width=device-width,initial-scale=1">'
         f"<title>{_esc(title)}</title><style>{HTML_STYLE}</style></head><body><main>"
         f'<h1>{_esc(q.origin_label)}<span class="arrow">→</span>{_esc(q.destination_label)}</h1>'
-        '<p class="sub">Business &amp; first class award availability from seats.aero. Miles and taxes are per passenger. '
+        f'<p class="sub">{_esc(q.cabins_label.capitalize())} class award availability from seats.aero. Miles and taxes are per passenger. '
         "Book links open the mileage program that holds the space; airline links open the operating carrier.</p>"
         f'<div class="chips">{chips_html}</div>{body}{notes_html}'
         f"<footer>Generated {_esc(result.generated_at)} · {result.api_calls} seats.aero API calls · cached data, verify before transferring points.</footer>"

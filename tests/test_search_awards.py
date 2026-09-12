@@ -521,18 +521,70 @@ class RenderingTests(unittest.TestCase):
         for key in ("program", "cabin", "airlines", "flight_numbers", "mileage_cost", "taxes_display", "booking_link", "seats_known"):
             self.assertIn(key, option)
 
-    def test_no_results_message_distinguishes_causes(self):
-        economy_only = sa.SearchResult(query=query(), options=[], notes=[], api_calls=1, availabilities_seen=5, generated_at="")
-        text = sa.render_markdown(economy_only)
+    def empty(self, q=None, **kw):
+        base = dict(query=q or query(), options=[], notes=[], api_calls=1, availabilities_seen=0, generated_at="", searched_on=date(2026, 9, 12))
+        base.update(kw)
+        return sa.SearchResult(**base)
+
+    def test_no_results_when_only_economy_is_cached(self):
+        text = sa.render_markdown(self.empty(availabilities_seen=5))
         self.assertIn("No business or first class award space found", text)
         self.assertIn("5 cached records", text)
-        self.assertIn("only economy or premium economy", text)
+        self.assertIn("none with business or first class space", text)
         self.assertIn("--flex 3", text)
-        nothing = sa.SearchResult(query=query(), options=[], notes=[], api_calls=1, availabilities_seen=0, generated_at="")
-        self.assertIn("any cabin", sa.render_markdown(nothing))
-        far = sa.SearchResult(query=query(start_date=date(2027, 10, 1), end_date=date(2027, 10, 1)), options=[], notes=[], api_calls=1, availabilities_seen=0, generated_at="")
-        self.assertIn("11 months out", far.query.explain_no_results(0, today=date(2026, 9, 12)))
-        self.assertIn("any cabin", sa.render_html(nothing))
+
+    def test_no_results_when_premium_space_exists_but_party_too_big(self):
+        r = self.empty(query(pax=2, direct_only=True), availabilities_seen=3, premium_matches=1)
+        text = sa.render_markdown(r)
+        self.assertIn("1 cached record show business or first class space", text)
+        self.assertIn("room for 2 passengers and a nonstop routing", text)
+        self.assertIn("--pax 1", text)
+        self.assertIn("dropping `--direct-only`", text)
+        self.assertNotIn("none with business", text)
+
+    def test_no_results_wording_respects_cabins_and_sources(self):
+        first_only = self.empty(query(cabins=("first",)), availabilities_seen=2)
+        text = sa.render_markdown(first_only)
+        self.assertIn("No first class award space found", text)
+        self.assertIn("none with first class space", text)
+        scoped = self.empty(query(sources=("aeroplan", "united")))
+        self.assertIn("The requested programs (aeroplan, united) has no award space", sa.render_markdown(scoped))
+        self.assertIn("any cabin", sa.render_html(self.empty()))
+        self.assertIn("First class award availability", sa.render_html(first_only))
+
+    def test_no_results_horizon_uses_search_date_not_render_date(self):
+        far = self.empty(query(start_date=date(2027, 10, 1), end_date=date(2027, 10, 1)))
+        self.assertIn("nothing cached this far ahead", far.explain_no_results())
+        near = self.empty(query(start_date=date(2027, 10, 1), end_date=date(2027, 10, 1)), searched_on=date(2027, 6, 1))
+        self.assertIn("any cabin", near.explain_no_results())
+
+    def test_no_results_in_schedule_opening_mode_does_not_contradict_itself(self):
+        r = self.empty(query(date_mode="schedule-opening", start_date=date(2027, 9, 1), end_date=date(2027, 9, 2)),
+                       notes=["No date was given, so this scanned 354-355 days out, where airlines first release award inventory."])
+        text = sa.render_markdown(r)
+        self.assertIn("has not cached SIN → LHR this far ahead yet", text)
+        self.assertNotIn("re-run once the date is closer", text)
+        self.assertIn("--flex 3", text)
+
+    def test_run_search_records_premium_matches_and_search_date(self):
+        client, _, _ = make_client(default_routes())
+        result = sa.run_search(client, query())
+        self.assertEqual(result.premium_matches, 2)
+        self.assertEqual(result.searched_on, date.today())
+        payload = json.loads(sa.render_json(result))
+        self.assertEqual(payload["premium_matches"], 2)
+        self.assertEqual(payload["searched_on"], date.today().isoformat())
+
+    def test_markdown_rows_have_exactly_as_many_cells_as_headers(self):
+        client, _, _ = make_client(default_routes())
+        for q in (query(), query(destination="LHR,LGW", start_date=date(2026, 11, 11), end_date=date(2026, 11, 17))):
+            result = sa.run_search(client, q)
+            table = [l for l in sa.render_markdown(result).splitlines() if l.startswith("|")]
+            widths = {len(l.strip("|").split("|")) for l in table}
+            self.assertEqual(len(widths), 1, table[:3])
+            html = sa.render_html(result)
+            self.assertEqual(html.count("<th") - html.count("<thead"), len(sa.table_columns(q)))
+            self.assertEqual(html.count("<tr>") - 1, len(result.options))
 
     def test_formatters(self):
         self.assertEqual(sa.format_duration(870), "14h 30m")

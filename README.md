@@ -112,10 +112,10 @@ Each run writes `award-reports/awards_SIN-LHR_2026-11-14_pax2.html` (override wi
 ## Premium-cabin award seats SIN → LHR
 Date: 2026-11-14 · Passengers: 2 · Cabins: Business, First
 
-| # | Program | Cabin | Airline | Flights | Date | Route | Dep → Arr | Duration | Stops | Seats | Miles / pax | Taxes / pax | Updated | Book |
-|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
-| 1 | Air Canada Aeroplan | Business | Singapore Airlines (SQ) | SQ308 | 2026-11-14 | SIN-LHR | 09:00 → 15:30 | 14h 30m | nonstop | 2 | 87,500 | 147.50 CAD | 3h ago | [book](…) |
-| 2 | Qantas Frequent Flyer | First | Qantas (QF) | QF1 | 2026-11-14 | SIN-LHR | 23:30 → 06:15 (+1) | 14h 45m | nonstop | ? | 162,800 | 520.00 AUD | 2d ago | [book](…) |
+| # | Program | Cabin | Airline | Flights | Dep → Arr | Duration | Stops | Seats | Miles / pax | Taxes / pax | Updated | Book |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| 1 | Air Canada Aeroplan | Business | Singapore Airlines (SQ) | SQ308 | 09:00 → 15:30 | 14h 30m | nonstop | 2 | 87,500 | 147.50 CAD | 3h ago | [book](…) |
+| 2 | Qantas Frequent Flyer | First | Qantas (QF) | QF1 | 23:30 → 06:15 (+1) | 14h 45m | nonstop | ? | 162,800 | 520.00 AUD | 2d ago | [book](…) |
 ```
 
 ## How it works
@@ -143,7 +143,7 @@ drive a seats.aero MCP server.
 ## Development
 
 ```bash
-./run_tests.sh              # 68 offline unit tests, network mocked
+./run_tests.sh              # 73 offline unit tests, network mocked
 ./scripts/check_secrets.sh  # credential scan
 ```
 
