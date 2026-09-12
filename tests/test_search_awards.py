@@ -578,7 +578,8 @@ class RenderingTests(unittest.TestCase):
         self.assertIn("| Flights | Date | Route | Dep → Arr |", text)
         self.assertIn("| 2026-11-14 | SIN-LHR |", text)
         html = sa.render_html(result)
-        self.assertIn("<th>Date</th><th>Route</th>", html)
+        self.assertIn(">Date</th>", html)
+        self.assertIn(">Route</th>", html)
 
     def test_markdown_overnight_arrival_marker(self):
         text = sa.render_markdown(self.result)
@@ -786,8 +787,8 @@ class CrossCheckRenderingTests(unittest.TestCase):
         client, _, _ = make_client(default_routes())
         result = sa.run_search(client, query())
         self.assertNotIn("| Sources |", sa.render_markdown(result))
-        self.assertNotIn("<th class=\"src\">", sa.render_html(result))
-        sa.apply_cross_check(result, [FIXTURES / "flightpoints_search.txt"])
+        self.assertNotIn('<th class="src"', sa.render_html(result))
+        sa.apply_cross_check(result, [FIXTURES / "flightpoints_search_sin_lhr.txt"])
         md = sa.render_markdown(result)
         self.assertIn("| Sources |", md)
         self.assertIn("Cross-checked with FlightPoints", md)
@@ -810,6 +811,62 @@ class CrossCheckRenderingTests(unittest.TestCase):
         self.assertIn('<tr class="confirmed">', html)
         self.assertIn("✓ 2 sources", html)
         self.assertIn("✓ seats.aero + FlightPoints", sa.render_markdown(result))
+
+    def test_entries_for_other_routes_or_dates_are_ignored(self):
+        client, _, _ = make_client(default_routes())
+        result = sa.run_search(client, query())   # SIN-LHR on 2026-11-14
+        # The SIN-HND 2026-12-27 fixture must confirm nothing here: it describes a different search.
+        sa.apply_cross_check(result, [FIXTURES / "flightpoints_search.txt"])
+        self.assertFalse(any(o.confirmed for o in result.options))
+        self.assertEqual(result.crosscheck.out_of_scope, 6)
+        self.assertEqual(result.crosscheck.unmatched, [])
+        note = next(n for n in result.notes if "FlightPoints" in n)
+        self.assertIn("describe other routes or dates", note)
+        self.assertNotIn("could be read", note)
+
+    def test_in_scope_program_entries_confirm_on_matching_price(self):
+        client, _, _ = make_client(default_routes())
+        result = sa.run_search(client, query())
+        sa.apply_cross_check(result, [FIXTURES / "flightpoints_search_sin_lhr.txt"])
+        confirmed = [o for o in result.options if o.confirmed]
+        self.assertEqual({(o.source, o.cabin, o.mileage_cost) for o in confirmed},
+                         {("aeroplan", "business", 87500), ("qantas", "first", 162800)})
+        self.assertTrue(all(o.confirmation == "program" for o in confirmed))
+        self.assertEqual(result.crosscheck.out_of_scope, 0)
+        self.assertTrue(result.options[0].confirmed)   # confirmed rows lead
+
+    def test_reapplying_a_cross_check_replaces_the_previous_note(self):
+        client, _, _ = make_client(default_routes())
+        result = sa.run_search(client, query())
+        sa.apply_cross_check(result, [FIXTURES / "flightpoints_search_sin_lhr.txt"])
+        sa.apply_cross_check(result, [FIXTURES / "flightpoints_search_sin_lhr.txt"])
+        self.assertEqual(sum(1 for n in result.notes if "Cross-checked against FlightPoints" in n), 1)
+
+    def test_load_restores_the_cross_check_summary(self):
+        client, _, _ = make_client(default_routes())
+        result = sa.run_search(client, query())
+        sa.apply_cross_check(result, [FIXTURES / "flightpoints_search_sin_lhr.txt"])
+        path = Path(tempfile.mkdtemp()) / "run.json"
+        path.write_text(sa.render_json(result))
+        loaded = sa.load_result(path)
+        self.assertIsNotNone(loaded.crosscheck)
+        self.assertEqual(loaded.crosscheck.program_matches, result.crosscheck.program_matches)
+        html = sa.render_html(loaded)
+        self.assertIn("✓ 2 sources", html)
+        self.assertIn(">Sources</th>", html)          # the badge and green rows are explained
+        self.assertIn("Confirmed by FlightPoints", html)
+
+    def test_load_without_a_summary_still_explains_confirmed_rows(self):
+        client, _, _ = make_client(default_routes())
+        result = sa.run_search(client, query())
+        sa.apply_cross_check(result, [FIXTURES / "flightpoints_search_sin_lhr.txt"])
+        payload = json.loads(sa.render_json(result))
+        payload.pop("crosscheck")
+        path = Path(tempfile.mkdtemp()) / "old.json"
+        path.write_text(json.dumps(payload))
+        loaded = sa.load_result(path)
+        self.assertIsNotNone(loaded.crosscheck)
+        self.assertIn(">Sources</th>", sa.render_html(loaded))
 
     def test_unreadable_cross_check_files_add_a_note_not_a_crash(self):
         client, _, _ = make_client(default_routes())
@@ -868,6 +925,71 @@ class LoadPreviousRunTests(unittest.TestCase):
             sa.parse_args(["SIN", "LHR", "--cross-check", "/nonexistent.txt"], today=date(2026, 9, 12))
 
 
+# --------------------------------------------------------------------------- sortable dashboard
+
+
+class SortableDashboardTests(unittest.TestCase):
+    def setUp(self):
+        client, _, _ = make_client(default_routes())
+        self.result = sa.run_search(client, query(pax=1, destination="LHR,LGW", start_date=date(2026, 11, 11), end_date=date(2026, 11, 17)))
+        self.html = sa.render_html(self.result)
+        self.columns = sa.html_columns(self.result.query)
+
+    def test_every_column_but_book_is_sortable(self):
+        sortable = [c.header for c in self.columns if c.sort is not None]
+        self.assertEqual(sortable, [c.header for c in self.columns if c.header != "Book"])
+        for index, column in enumerate(self.columns):
+            if column.sort is not None:
+                self.assertIn(f'data-col="{index}" tabindex="0" role="button" aria-sort="none"', self.html)
+        self.assertEqual(self.html.count('aria-sort="none"'), len(sortable))
+        self.assertNotIn('title="Sort by Book"', self.html)
+
+    def test_numeric_columns_carry_numeric_sort_keys(self):
+        row = self.result.options[0]
+        keys = {c.header: c.sort(1, row) for c in self.columns if c.sort}
+        self.assertEqual(keys["Miles / pax"], row.mileage_cost)
+        self.assertEqual(keys["Duration"], row.duration_minutes)
+        self.assertEqual(keys["Seats"], -row.remaining_seats)       # most seats first under ascending
+        self.assertEqual(keys["Dep → Arr"], 9 * 60)                 # 09:00 departure
+        self.assertEqual(keys["Date"], "2026-11-14")
+        self.assertEqual(keys["Cabin"], 1)                           # first (0) sorts above business (1)
+        self.assertIn('data-sort="87500"', self.html)
+        self.assertIn('data-sort="870"', self.html)
+
+    def test_unknown_values_sort_last_not_first(self):
+        unknown = sa.AwardOption(program="X", source="x", cabin="business", travel_date="2026-11-14", route="SIN-LHR",
+                                 airlines=[], flight_numbers="-", departs_at="", arrives_at="", duration_minutes=0,
+                                 stops=-1, remaining_seats=0, mileage_cost=0, taxes_minor_units=0, taxes_currency="", booking_link="")
+        keys = {c.header: c.sort(1, unknown) for c in self.columns if c.sort}
+        self.assertGreater(keys["Miles / pax"], 10**8)
+        self.assertGreater(keys["Duration"], 10**5)
+        self.assertGreater(keys["Dep → Arr"], 10**5)
+        self.assertEqual(keys["Seats"], 1)      # after every row with a known count (negative keys)
+        self.assertGreater(keys["Updated"], 10**5)
+
+    def test_text_sort_keys_are_escaped_and_lowercased(self):
+        evil = sa.AwardOption(program='<b>"x"</b>', source="x", cabin="business", travel_date="2026-11-14", route="SIN-LHR",
+                              airlines=[], flight_numbers="SQ1", departs_at="", arrives_at="", duration_minutes=1,
+                              stops=0, remaining_seats=1, mileage_cost=1, taxes_minor_units=0, taxes_currency="", booking_link="")
+        result = sa.SearchResult(query=self.result.query, options=[evil], notes=[], api_calls=0, availabilities_seen=1, generated_at="")
+        html = sa.render_html(result)
+        self.assertIn('data-sort="&lt;b&gt;&quot;x&quot;&lt;/b&gt;"', html)
+        self.assertNotIn('data-sort="<b>', html)
+
+    def test_script_is_inline_and_table_is_addressable(self):
+        self.assertIn('<table id="awards">', self.html)
+        self.assertIn("getElementById('awards')", self.html)
+        self.assertIn("Click a column heading to sort", self.html)
+        self.assertNotIn("<script src", self.html)     # self-contained: no external dependency
+        self.assertIn("e.key === 'Enter'", self.html)  # keyboard accessible
+
+    def test_default_order_hint_mentions_cross_check_only_when_present(self):
+        self.assertIn("the cheapest first", self.html)
+        self.assertNotIn("confirmed by both sources first", self.html)
+        sa.apply_cross_check(self.result, [FIXTURES / "flightpoints_search_sin_lhr.txt"])
+        self.assertIn("confirmed by both sources first", sa.render_html(self.result))
+
+
 # --------------------------------------------------------------------------- html report
 
 
@@ -894,7 +1016,7 @@ class HtmlReportTests(unittest.TestCase):
     def test_dashboard_is_narrow_taxes_only_in_markdown(self):
         self.assertNotIn("<th>Taxes / pax</th>", self.html)
         self.assertNotIn("<th>Stops</th>", self.html)
-        self.assertIn('<th class="wrap">Program</th>', self.html)
+        self.assertIn('<th class="wrap" data-col="1"', self.html)
         self.assertIn('title="Air Canada Aeroplan">Aeroplan<', self.html)
         self.assertIn('<div class="muted">nonstop</div>', self.html)
         self.assertNotIn("min-width:960px", self.html)

@@ -923,10 +923,20 @@ def sort_options(options: list[AwardOption]) -> None:
     options.sort(key=lambda o: (crosscheck.CONFIRMATION_RANK.get(o.confirmation, 2), o.mileage_cost or 10**9, o.taxes_minor_units, o.departs_at))
 
 
+CROSS_CHECK_NOTE_MARKERS = ("FlightPoints", "Cross-check")
+
+
 def apply_cross_check(result: SearchResult, paths: Sequence[Path], log: Callable[[str], None] = lambda _: None) -> None:
     """Match FlightPoints output files against the seats.aero rows and regroup the report."""
+    # A --load run may already carry notes from an earlier cross-check; this one supersedes them.
+    result.notes = [n for n in result.notes if not any(m in n for m in CROSS_CHECK_NOTE_MARKERS)]
     entries, files, empty_files = crosscheck.load_files(list(paths))
+    before = len(entries)
+    entries = [e for e in entries if crosscheck.entry_in_scope(e, result.query)]
+    if len(entries) < before:
+        log(f"cross-check: ignored {before - len(entries)} entry(ies) outside {result.query.origin_label}->{result.query.destination_label} {result.query.window_label}")
     summary = crosscheck.match_options(result.options, entries)
+    summary.out_of_scope = before - len(entries)
     summary.files = files
     summary.empty_files = empty_files
     result.crosscheck = summary
@@ -934,7 +944,10 @@ def apply_cross_check(result: SearchResult, paths: Sequence[Path], log: Callable
     confirmed = summary.flight_matches + summary.program_matches
     log(f"cross-check: {files} FlightPoints file(s), {len(entries)} entries, {confirmed} of {len(result.options)} rows confirmed")
     if not entries:
-        if summary.answered:
+        if summary.out_of_scope:
+            result.notes.insert(0, f"Cross-check found no usable FlightPoints data for this search: all {summary.out_of_scope} entry(ies) in "
+                                   f"{files} file(s) describe other routes or dates. Rows are seats.aero only.")
+        elif summary.answered:
             result.notes.insert(0, f"FlightPoints was queried ({files} searches) and reported no business or first space on this route and date(s), "
                                    "so none of these rows is confirmed by a second source. Treat them as seats.aero-only until you check the program's site.")
         else:
@@ -946,6 +959,8 @@ def apply_cross_check(result: SearchResult, paths: Sequence[Path], log: Callable
         note += f" Price differed on {len(summary.price_disagreements)}: " + "; ".join(summary.price_disagreements[:3]) + ("…" if len(summary.price_disagreements) > 3 else "") + "."
     if summary.unmatched:
         note += f" FlightPoints also lists {len(summary.unmatched)} premium option(s) seats.aero did not: " + "; ".join(summary.unmatched[:4]) + ("…" if len(summary.unmatched) > 4 else "") + "."
+    if summary.out_of_scope:
+        note += f" ({summary.out_of_scope} FlightPoints entry(ies) for other routes or dates were ignored.)"
     result.notes.insert(0, note)
 
 
@@ -969,12 +984,25 @@ def load_result(path: Path) -> SearchResult:
         r = payload["refresh"]
         refresh = RefreshOutcome(requested=int(r.get("requested", 0)), statuses=dict(r.get("statuses") or {}), quota=dict(r.get("quota") or {}),
                                  timed_out=bool(r.get("timed_out")), waited_seconds=float(r.get("waited_seconds", 0)), capped_from=int(r.get("capped_from", 0)))
+    cross = None
+    if payload.get("crosscheck"):
+        c = payload["crosscheck"]
+        cross = crosscheck.CrossCheckSummary(
+            entries=int(c.get("entries", 0)), files=int(c.get("files", 0)), empty_files=int(c.get("empty_files", 0)),
+            flight_matches=int(c.get("flight_matches", 0)), program_matches=int(c.get("program_matches", 0)),
+            price_disagreements=list(c.get("price_disagreements") or []), unmatched=list(c.get("unmatched") or []),
+            out_of_scope=int(c.get("out_of_scope", 0)),
+        )
+    elif any(o.confirmed for o in options):
+        # Rows were confirmed by a cross-check whose summary is missing; keep the Sources column so the
+        # highlighted, confirmation-first ordering is explained rather than unexplained.
+        cross = crosscheck.CrossCheckSummary(entries=sum(1 for o in options if o.confirmed))
     searched_on = payload.get("searched_on")
     return SearchResult(
         query=query, options=options, notes=list(payload.get("notes") or []), api_calls=int(payload.get("api_calls", 0)),
         availabilities_seen=int(payload.get("availabilities_seen", 0)), generated_at=str(payload.get("generated_at", "")),
         refresh=refresh, premium_matches=int(payload.get("premium_matches", 0)),
-        searched_on=date.fromisoformat(searched_on) if searched_on else None,
+        searched_on=date.fromisoformat(searched_on) if searched_on else None, crosscheck=cross,
     )
 
 
@@ -1019,6 +1047,9 @@ class Column:
     css: str = ""
     in_html: bool = True      # the HTML dashboard is kept narrow enough to read without scrolling
     in_markdown: bool = True  # the markdown summary is what Claude reads, so it can carry more
+    # Value the dashboard sorts on. Numbers sort numerically, anything else as lowercase text;
+    # None makes the column unsortable (the Book button has no meaningful order).
+    sort: Callable[[int, AwardOption], str | int | float] | None = None
 
 
 def _dep_arr(o: AwardOption) -> str:
@@ -1069,33 +1100,45 @@ def markdown_columns(q: SearchQuery, with_sources: bool = False) -> list[Column]
 def table_columns(q: SearchQuery, with_sources: bool = False) -> list[Column]:
     """Date and Route only earn a column when they vary between rows; Sources only when a cross-check ran."""
     cols = [
-        Column("#", lambda i, o: str(i), lambda i, o: str(i), "num"),
-        Column("Program", lambda i, o: o.program, lambda i, o: _html_program(o), "wrap"),
-        Column("Cabin", lambda i, o: o.cabin.title(), lambda i, o: f'<span class="badge {_esc(o.cabin)}">{_esc(o.cabin.title())}</span>'),
+        Column("#", lambda i, o: str(i), lambda i, o: str(i), "num", sort=lambda i, o: i),
+        Column("Program", lambda i, o: o.program, lambda i, o: _html_program(o), "wrap", sort=lambda i, o: o.program),
+        Column("Cabin", lambda i, o: o.cabin.title(), lambda i, o: f'<span class="badge {_esc(o.cabin)}">{_esc(o.cabin.title())}</span>',
+               sort=lambda i, o: 0 if o.cabin == "first" else 1),   # first above business
     ]
     if with_sources:
-        cols.append(Column("Sources", lambda i, o: format_sources(o), lambda i, o: _html_sources(o), "src"))
+        cols.append(Column("Sources", lambda i, o: format_sources(o), lambda i, o: _html_sources(o), "src",
+                           sort=lambda i, o: crosscheck.CONFIRMATION_RANK.get(o.confirmation, 2)))
     cols += [
-        Column("Airline", lambda i, o: format_airlines(o.airlines), lambda i, o: _html_airlines(o.airlines), "wrap"),
-        Column("Flights", lambda i, o: o.flight_numbers, lambda i, o: _flights_html(o)),
+        Column("Airline", lambda i, o: format_airlines(o.airlines), lambda i, o: _html_airlines(o.airlines), "wrap",
+               sort=lambda i, o: format_airlines(o.airlines)),
+        Column("Flights", lambda i, o: o.flight_numbers, lambda i, o: _flights_html(o), sort=lambda i, o: o.flight_numbers),
     ]
     if not q.single_day:
-        cols.append(Column("Date", lambda i, o: o.travel_date, lambda i, o: _esc(o.travel_date)))
+        cols.append(Column("Date", lambda i, o: o.travel_date, lambda i, o: _esc(o.travel_date), sort=lambda i, o: o.travel_date))
     if q.multi_airport:
-        cols.append(Column("Route", lambda i, o: o.route, lambda i, o: _esc(o.route)))
+        cols.append(Column("Route", lambda i, o: o.route, lambda i, o: _esc(o.route), sort=lambda i, o: o.route))
     cols += [
-        Column("Dep → Arr", lambda i, o: _dep_arr(o), lambda i, o: _esc(_dep_arr(o))),
-        Column("Duration", lambda i, o: format_duration(o.duration_minutes), lambda i, o: _html_duration_stops(o)),
-        Column("Stops", lambda i, o: format_stops(o.stops), lambda i, o: "", in_html=False),  # folded under Duration in HTML
+        Column("Dep → Arr", lambda i, o: _dep_arr(o), lambda i, o: _esc(_dep_arr(o)), sort=lambda i, o: _minutes_of_day(o.departs_at)),
+        Column("Duration", lambda i, o: format_duration(o.duration_minutes), lambda i, o: _html_duration_stops(o),
+               sort=lambda i, o: o.duration_minutes or 10**6),   # unknown durations last when sorting shortest first
+        Column("Stops", lambda i, o: format_stops(o.stops), lambda i, o: "", in_html=False, sort=lambda i, o: o.stops if o.stops >= 0 else 99),
         Column("Seats", lambda i, o: _seats_text(o),
-               lambda i, o: _esc(_seats_text(o)) if o.seats_known else '<span title="Program does not publish seat counts">?</span>', "num"),
-        Column("Miles / pax", lambda i, o: format_miles(o.mileage_cost), lambda i, o: _esc(format_miles(o.mileage_cost)), "num miles"),
+               lambda i, o: _esc(_seats_text(o)) if o.seats_known else '<span title="Program does not publish seat counts">?</span>', "num",
+               sort=lambda i, o: -o.remaining_seats if o.seats_known else 1),   # most seats first; unknown last
+        Column("Miles / pax", lambda i, o: format_miles(o.mileage_cost), lambda i, o: _esc(format_miles(o.mileage_cost)), "num miles",
+               sort=lambda i, o: o.mileage_cost or 10**9),
         Column("Taxes / pax", lambda i, o: format_taxes(o.taxes_minor_units, o.taxes_currency),
-               lambda i, o: "", "num", in_html=False),  # kept out of the dashboard for width; in markdown, JSON and the summary cards
-        Column("Updated", lambda i, o: format_age(o.updated_at), lambda i, o: _updated_html(o)),
+               lambda i, o: "", "num", in_html=False, sort=lambda i, o: o.taxes_minor_units),
+        Column("Updated", lambda i, o: format_age(o.updated_at), lambda i, o: _updated_html(o),
+               sort=lambda i, o: round(max(_hours_since(o.updated_at), 0.0), 3) if o.updated_at else 10**6),   # freshest first
         Column("Book", lambda i, o: _book_markdown(o), lambda i, o: _book_html(o), "book-cell"),
     ]
     return cols
+
+
+def _minutes_of_day(value: str) -> int:
+    parsed = _parse_time(value)
+    return parsed.hour * 60 + parsed.minute if parsed else 10**6
 
 
 def _next_steps_hint(q: SearchQuery) -> str:
@@ -1196,6 +1239,13 @@ h1 .arrow{color:var(--accent);margin:0 8px}
 table{border-collapse:separate;border-spacing:0;width:100%;font-size:13px}
 th,td{padding:7px 6px;text-align:left;vertical-align:top;border-bottom:1px solid var(--border);white-space:nowrap;background:var(--surface)}
 th{font-size:11px;text-transform:uppercase;letter-spacing:.05em;color:var(--muted);background:var(--surface-2);position:sticky;top:0;z-index:1}
+th[data-col]{cursor:pointer;user-select:none}
+th[data-col]:hover,th[data-col]:focus-visible{color:var(--text);outline:none}
+th[data-col]::after{content:"↕";opacity:.35;margin-left:4px;font-size:10px}
+th[aria-sort=ascending]::after{content:"↑";opacity:1}
+th[aria-sort=descending]::after{content:"↓";opacity:1}
+th.sorted{color:var(--accent)}
+.tablehint{color:var(--muted);font-size:12px;margin:8px 0 0}
 td.wrap,th.wrap{white-space:normal;min-width:96px;max-width:150px}
 td.book-cell,th.book-cell{text-align:right}
 tbody tr:hover td{background:var(--surface-2)}
@@ -1291,12 +1341,74 @@ def _html_summary_cards(result: SearchResult) -> str:
 
 def _html_table(result: SearchResult) -> str:
     columns = html_columns(result.query, result.crosscheck is not None)
-    head = "".join(f'<th{_css(c.css)}>{_esc(c.header)}</th>' for c in columns)
+    head = "".join(
+        f'<th{_css(c.css)}{_sortable_attrs(n, c)}>{_esc(c.header)}</th>' for n, c in enumerate(columns)
+    )
     rows = "".join(
-        _css_tr(o) + "".join(f"<td{_css(c.css)}>{c.html(idx, o)}</td>" for c in columns) + "</tr>"
+        _css_tr(o) + "".join(f"<td{_css(c.css)}{_sort_attr(c, idx, o)}>{c.html(idx, o)}</td>" for c in columns) + "</tr>"
         for idx, o in enumerate(result.options, start=1)
     )
-    return f'<div class="tablewrap"><table><thead><tr>{head}</tr></thead><tbody>{rows}</tbody></table></div>'
+    return (f'<div class="tablewrap"><table id="awards"><thead><tr>{head}</tr></thead><tbody>{rows}</tbody></table></div>'
+            f"<p class=\"tablehint\">Click a column heading to sort; click again to reverse. The default order puts "
+            f"{'rows confirmed by both sources first, then ' if result.crosscheck is not None else ''}the cheapest first.</p>"
+            f"<script>{SORT_SCRIPT}</script>")
+
+
+def _sortable_attrs(index: int, column: Column) -> str:
+    """Headers are styled and wired through data-col, so no extra class is needed."""
+    if column.sort is None:
+        return ""
+    return f' data-col="{index}" tabindex="0" role="button" aria-sort="none" title="Sort by {_esc(column.header)}"'
+
+
+def _sort_attr(column: Column, idx: int, option: AwardOption) -> str:
+    if column.sort is None:
+        return ""
+    value = column.sort(idx, option)
+    return f' data-sort="{_esc(value if not isinstance(value, str) else value.lower())}"'
+
+
+# Progressive enhancement: the table is complete and readable without this script.
+SORT_SCRIPT = """
+(function () {
+  var table = document.getElementById('awards');
+  if (!table) return;
+  var body = table.tBodies[0];
+  var heads = [].slice.call(table.tHead.rows[0].cells);
+  function keyOf(row, col) {
+    var cell = row.cells[col];
+    return cell && cell.hasAttribute('data-sort') ? cell.getAttribute('data-sort') : '';
+  }
+  function sortBy(col, dir) {
+    var rows = [].slice.call(body.rows);
+    var numeric = rows.every(function (r) { var k = keyOf(r, col); return k === '' || !isNaN(parseFloat(k)); });
+    rows.sort(function (a, b) {
+      var x = keyOf(a, col), y = keyOf(b, col);
+      var cmp = numeric ? (parseFloat(x || 'Infinity') - parseFloat(y || 'Infinity')) : x.localeCompare(y);
+      return dir === 'descending' ? -cmp : cmp;
+    });
+    rows.forEach(function (r) { body.appendChild(r); });
+    heads.forEach(function (h, i) {
+      h.setAttribute('aria-sort', i === col ? dir : 'none');
+      h.classList.toggle('sorted', i === col);
+    });
+  }
+  function activate(head) {
+    var col = parseInt(head.getAttribute('data-col'), 10);
+    var dir = head.getAttribute('aria-sort') === 'ascending' ? 'descending' : 'ascending';
+    sortBy(col, dir);
+  }
+  heads.forEach(function (head) {
+    if (!head.hasAttribute('data-col')) return;
+    head.addEventListener('click', function () { activate(head); });
+    head.addEventListener('keydown', function (e) {
+      if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); activate(head); }
+    });
+  });
+  var m = /^#sort=(\\d+):(asc|desc)$/.exec(location.hash || '');
+  if (m) sortBy(parseInt(m[1], 10), m[2] === 'desc' ? 'descending' : 'ascending');
+})();
+"""
 
 
 def _css(css: str) -> str:

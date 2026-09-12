@@ -15,6 +15,7 @@ from __future__ import annotations
 import json
 import re
 from dataclasses import dataclass, field
+from datetime import date
 from pathlib import Path
 from typing import Any, Iterable, Sequence
 
@@ -86,6 +87,7 @@ class CrossCheckSummary:
     program_matches: int = 0
     price_disagreements: list[str] = field(default_factory=list)
     unmatched: list[str] = field(default_factory=list)   # FlightPoints entries seats.aero did not have
+    out_of_scope: int = 0                                # entries discarded for a different route or date
 
     @property
     def answered(self) -> bool:
@@ -97,6 +99,7 @@ class CrossCheckSummary:
             "provider": "flightpoints", "files": self.files, "entries": self.entries, "empty_files": self.empty_files,
             "flight_matches": self.flight_matches, "program_matches": self.program_matches,
             "price_disagreements": self.price_disagreements, "unmatched": self.unmatched,
+            "out_of_scope": self.out_of_scope,
         }
 
 
@@ -243,6 +246,24 @@ def load_files(paths: Sequence[Path]) -> tuple[list[CrossCheckEntry], int, int]:
         if not found and is_empty_result(text):
             empty += 1
     return entries, files, empty
+
+
+def entry_in_scope(entry: CrossCheckEntry, query: Any) -> bool:
+    """Keep only entries for the searched airports and date window.
+
+    Cross-check files accumulate in a directory across searches, and FlightPoints' search-flights
+    output carries one header date even when queried with a +/-N day delta, so an entry can legitimately
+    describe another day. Confirming a row against such an entry would be a false positive.
+    """
+    try:
+        entry_date = date.fromisoformat(entry.date)
+    except ValueError:
+        return False
+    if not (query.start_date <= entry_date <= query.end_date):
+        return False
+    origins = set(query.origin.split(","))
+    destinations = set(query.destination.split(","))
+    return (not entry.origin or entry.origin in origins) and (not entry.destination or entry.destination in destinations)
 
 
 # --------------------------------------------------------------------------- matching

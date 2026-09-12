@@ -59,6 +59,9 @@ Every run produces two things:
   This is the deliverable the user reads.
 - **A markdown summary** on stdout for you to read, ending with the report path. Progress goes to stderr.
 
+In the HTML report every column except Book is sortable: the user clicks a heading to sort and clicks again to
+reverse, with unknown values sorted last. Mention this once when you hand over a report with many rows.
+
 Exit codes: 0 success (including "no availability"), 2 bad input or missing key, 3 API/auth/network failure.
 Read stderr when it is non-zero; the message says what to fix.
 

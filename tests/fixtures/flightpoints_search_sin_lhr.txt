@@ -1,0 +1,8 @@
+Award Flight Search: SIN → LHR
+Date: 2026-11-14  |  Cabin: Business  |  Passengers: 1
+
+Search complete. Found 2 award flight option(s).
+
+Premium cabins (points):
+- Aeroplan: Biz 87,500+$110
+- Frequent Flyer: First 162,800+$340

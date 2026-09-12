@@ -151,6 +151,17 @@ python3 scripts/search_awards.py --load award-reports/run.json --cross-check awa
 ```
 
 `--load` re-renders a previous `--json` run without calling seats.aero, so the cross-check costs no quota.
+Cross-check files are filtered to the searched airports and date window, so a shared directory of saved
+FlightPoints output cannot confirm a row from some other search.
+
+## Sorting the dashboard
+
+Every column except Book sorts: click a heading, click again to reverse. Numbers sort numerically, text
+alphabetically, and unknown values (`?` seats, missing durations) always sort last rather than first. The
+default order is cheapest first, or rows confirmed by both sources first when a cross-check ran. Appending
+`#sort=<column index>:asc` or `:desc` to the file URL opens the report already sorted, which is useful for
+sharing a particular view. The sorter is a few lines of inline JavaScript; the table is complete and readable
+without it.
 
 ## How it works
 
@@ -178,7 +189,7 @@ drive a seats.aero MCP server.
 ## Development
 
 ```bash
-./run_tests.sh              # 100 offline unit tests, network mocked
+./run_tests.sh              # 110 offline unit tests, network mocked
 ./scripts/check_secrets.sh  # credential scan
 ```
 
