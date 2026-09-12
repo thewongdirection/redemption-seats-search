@@ -655,7 +655,8 @@ class RenderingTests(unittest.TestCase):
             widths = {len(l.strip("|").split("|")) for l in table}
             self.assertEqual(len(widths), 1, table[:3])
             html = sa.render_html(result)
-            self.assertEqual(html.count("<th") - html.count("<thead"), len(sa.table_columns(q)))
+            self.assertEqual(html.count("<th") - html.count("<thead"), len(sa.html_columns(q)))
+            self.assertEqual(len(table[0].strip("|").split("|")), len(sa.markdown_columns(q)))
             self.assertEqual(html.count("<tr>") - 1, len(result.options))
 
     def test_formatters(self):
@@ -681,18 +682,33 @@ class HtmlReportTests(unittest.TestCase):
         self.assertTrue(self.html.startswith("<!doctype html>"))
         self.assertIn("color-scheme:dark", self.html)
         self.assertIn("<title>Award seats SIN → LHR · 2026-11-14</title>", self.html)
-        self.assertIn("<th>Book</th>", self.html)
-        self.assertIn("td:last-child{position:sticky;right:0", self.html)
+        self.assertIn(">Book</th>", self.html)
+        self.assertNotIn("position:sticky;right:0", self.html)   # table is narrow enough not to need a pinned column
 
     def test_rows_link_to_program_booking_page_and_airline_site(self):
         self.assertIn('class="book" href="https://www.aircanada.com/aeroplan/redeem/availability/outbound?org0=SIN&amp;dest0=LHR', self.html)
+        self.assertIn(">Book</a>", self.html)
         self.assertIn('href="https://www.singaporeair.com/"', self.html)
+        self.assertIn(">Singapore Airlines</a>", self.html)        # no "(SQ)" suffix in the dashboard
+        self.assertNotIn("Singapore Airlines (SQ)", self.html)
+
+    def test_dashboard_is_narrow_taxes_only_in_markdown(self):
+        self.assertNotIn("<th>Taxes / pax</th>", self.html)
+        self.assertNotIn("<th>Stops</th>", self.html)
+        self.assertIn('<th class="wrap">Program</th>', self.html)
+        self.assertIn('title="Air Canada Aeroplan">Aeroplan<', self.html)
+        self.assertIn('<div class="muted">nonstop</div>', self.html)
+        self.assertNotIn("min-width:960px", self.html)
+        md = sa.render_markdown(self.result)
+        self.assertIn("| Taxes / pax |", md)
+        self.assertIn("| Stops |", md)
+        self.assertIn("147.50 CAD", md)
         self.assertIn('rel="noopener noreferrer"', self.html)
 
     def test_falls_back_to_program_site_when_api_has_no_deep_link(self):
         # Qantas fixture returns no booking_links
         self.assertIn('class="book book-fallback" href="https://www.qantas.com/', self.html)
-        self.assertIn("Program site →", self.html)
+        self.assertIn(">Site</a>", self.html)
 
     def test_summary_cards_show_best_per_cabin(self):
         self.assertIn("Best business", self.html)
@@ -742,6 +758,7 @@ class HtmlReportTests(unittest.TestCase):
 
     def test_every_program_has_booking_fallback_and_https_urls(self):
         self.assertEqual(set(sa.PROGRAM_BOOKING_URLS), set(sa.PROGRAM_NAMES))
+        self.assertEqual(set(sa.PROGRAM_SHORT_NAMES), set(sa.PROGRAM_NAMES))
         self.assertIn("british", sa.PROGRAM_NAMES)   # seen live in September 2026
         for url in list(sa.PROGRAM_BOOKING_URLS.values()) + list(sa.AIRLINE_URLS.values()):
             self.assertTrue(url.startswith("https://"), url)

@@ -94,6 +94,17 @@ PROGRAM_NAMES = {
     "virginatlantic": "Virgin Atlantic Flying Club",
 }
 
+# Compact labels for the HTML table; the full PROGRAM_NAMES value is shown on hover.
+PROGRAM_SHORT_NAMES = {
+    "aeromexico": "Aeromexico", "aeroplan": "Aeroplan", "alaska": "Alaska Atmos", "american": "AAdvantage",
+    "azul": "Azul", "british": "BA Club", "connectmiles": "ConnectMiles", "delta": "SkyMiles",
+    "emirates": "Skywards", "ethiopian": "ShebaMiles", "etihad": "Etihad Guest", "eurobonus": "EuroBonus",
+    "finnair": "Finnair Plus", "flyingblue": "Flying Blue", "frontier": "Frontier", "jetblue": "TrueBlue",
+    "lufthansa": "Miles & More", "qantas": "Qantas FF", "qatar": "Privilege Club", "saudia": "AlFursan",
+    "singapore": "KrisFlyer", "smiles": "Smiles", "spirit": "Free Spirit", "turkish": "Miles&Smiles",
+    "united": "MileagePlus", "velocity": "Velocity", "virginatlantic": "Flying Club",
+}
+
 AIRLINE_NAMES = {
     "AA": "American", "AC": "Air Canada", "AF": "Air France", "AI": "Air India",
     "AM": "Aeromexico", "AS": "Alaska", "AV": "Avianca", "AY": "Finnair",
@@ -929,6 +940,8 @@ class Column:
     markdown: Callable[[int, AwardOption], str]
     html: Callable[[int, AwardOption], str]
     css: str = ""
+    in_html: bool = True      # the HTML dashboard is kept narrow enough to read without scrolling
+    in_markdown: bool = True  # the markdown summary is what Claude reads, so it can carry more
 
 
 def _dep_arr(o: AwardOption) -> str:
@@ -947,9 +960,9 @@ def _book_markdown(o: AwardOption) -> str:
 def _book_html(o: AwardOption) -> str:
     url = booking_url(o)
     if url and safe_url(o.booking_link):
-        return _html_link(url, "Book →", "book")
+        return _html_link(url, "Book", "book")
     if url:
-        return _html_link(url, "Program site →", "book book-fallback")
+        return _html_link(url, "Site", "book book-fallback")
     return "-"
 
 
@@ -968,11 +981,19 @@ def _updated_html(o: AwardOption) -> str:
     return text
 
 
+def html_columns(q: SearchQuery) -> list[Column]:
+    return [c for c in table_columns(q) if c.in_html]
+
+
+def markdown_columns(q: SearchQuery) -> list[Column]:
+    return [c for c in table_columns(q) if c.in_markdown]
+
+
 def table_columns(q: SearchQuery) -> list[Column]:
     """Date and Route only earn a column when they vary between rows."""
     cols = [
         Column("#", lambda i, o: str(i), lambda i, o: str(i), "num"),
-        Column("Program", lambda i, o: o.program, lambda i, o: _esc(o.program), "wrap"),
+        Column("Program", lambda i, o: o.program, lambda i, o: _html_program(o), "wrap"),
         Column("Cabin", lambda i, o: o.cabin.title(), lambda i, o: f'<span class="badge {_esc(o.cabin)}">{_esc(o.cabin.title())}</span>'),
         Column("Airline", lambda i, o: format_airlines(o.airlines), lambda i, o: _html_airlines(o.airlines), "wrap"),
         Column("Flights", lambda i, o: o.flight_numbers, lambda i, o: _flights_html(o)),
@@ -983,15 +1004,15 @@ def table_columns(q: SearchQuery) -> list[Column]:
         cols.append(Column("Route", lambda i, o: o.route, lambda i, o: _esc(o.route)))
     cols += [
         Column("Dep → Arr", lambda i, o: _dep_arr(o), lambda i, o: _esc(_dep_arr(o))),
-        Column("Duration", lambda i, o: format_duration(o.duration_minutes), lambda i, o: _esc(format_duration(o.duration_minutes))),
-        Column("Stops", lambda i, o: format_stops(o.stops), lambda i, o: _esc(format_stops(o.stops))),
+        Column("Duration", lambda i, o: format_duration(o.duration_minutes), lambda i, o: _html_duration_stops(o)),
+        Column("Stops", lambda i, o: format_stops(o.stops), lambda i, o: "", in_html=False),  # folded under Duration in HTML
         Column("Seats", lambda i, o: _seats_text(o),
                lambda i, o: _esc(_seats_text(o)) if o.seats_known else '<span title="Program does not publish seat counts">?</span>', "num"),
         Column("Miles / pax", lambda i, o: format_miles(o.mileage_cost), lambda i, o: _esc(format_miles(o.mileage_cost)), "num miles"),
         Column("Taxes / pax", lambda i, o: format_taxes(o.taxes_minor_units, o.taxes_currency),
-               lambda i, o: _esc(format_taxes(o.taxes_minor_units, o.taxes_currency)), "num"),
+               lambda i, o: "", "num", in_html=False),  # kept out of the dashboard for width; in markdown, JSON and the summary cards
         Column("Updated", lambda i, o: format_age(o.updated_at), lambda i, o: _updated_html(o)),
-        Column("Book", lambda i, o: _book_markdown(o), lambda i, o: _book_html(o)),
+        Column("Book", lambda i, o: _book_markdown(o), lambda i, o: _book_html(o), "book-cell"),
     ]
     return cols
 
@@ -1027,7 +1048,7 @@ def render_markdown(result: SearchResult, report_path: Path | None = None) -> st
             lines.append(f"\n_HTML report: {report_path}_")
         return "\n".join(lines)
 
-    columns = table_columns(q)
+    columns = markdown_columns(q)
     lines += ["| " + " | ".join(c.header for c in columns) + " |", "|" + "---|" * len(columns)]
     for idx, o in enumerate(result.options, start=1):
         lines.append("| " + " | ".join(c.markdown(idx, o).replace("|", "/") for c in columns) + " |")
@@ -1076,7 +1097,7 @@ HTML_STYLE = """
 --accent:#7aa2f7;--business:#73daca;--first:#e0af68;--warn:#f7768e;--ok:#9ece6a;color-scheme:dark}
 *{box-sizing:border-box}
 body{margin:0;background:var(--bg);color:var(--text);font:15px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif}
-main{max-width:1400px;margin:0 auto;padding:32px 24px 48px}
+main{max-width:1240px;margin:0 auto;padding:28px 20px 44px}
 h1{font-size:28px;margin:0 0 6px;letter-spacing:-.01em}
 h1 .arrow{color:var(--accent);margin:0 8px}
 .sub{color:var(--muted);margin:0 0 20px}
@@ -1089,24 +1110,24 @@ h1 .arrow{color:var(--accent);margin:0 8px}
 .card .value{font-size:22px;font-weight:600;margin-top:4px}
 .card .detail{font-size:13px;color:var(--muted);margin-top:2px}
 .tablewrap{overflow-x:auto;border:1px solid var(--border);border-radius:12px;background:var(--surface)}
-table{border-collapse:separate;border-spacing:0;width:100%;min-width:960px;font-size:14px}
-th,td{padding:9px 8px;text-align:left;vertical-align:top;border-bottom:1px solid var(--border);white-space:nowrap;background:var(--surface)}
-th{font-size:12px;text-transform:uppercase;letter-spacing:.06em;color:var(--muted);background:var(--surface-2);position:sticky;top:0;z-index:1}
-td.wrap,th.wrap{white-space:normal;min-width:150px}
-th:last-child,td:last-child{position:sticky;right:0;z-index:2;box-shadow:-8px 0 12px -8px rgba(0,0,0,.6)}
+table{border-collapse:separate;border-spacing:0;width:100%;font-size:13px}
+th,td{padding:7px 6px;text-align:left;vertical-align:top;border-bottom:1px solid var(--border);white-space:nowrap;background:var(--surface)}
+th{font-size:11px;text-transform:uppercase;letter-spacing:.05em;color:var(--muted);background:var(--surface-2);position:sticky;top:0;z-index:1}
+td.wrap,th.wrap{white-space:normal;min-width:96px;max-width:150px}
+td.book-cell,th.book-cell{text-align:right}
 tbody tr:hover td{background:var(--surface-2)}
 tr:last-child td{border-bottom:0}
 .num{text-align:right;font-variant-numeric:tabular-nums}
-.badge{display:inline-block;padding:2px 9px;border-radius:999px;font-size:12px;font-weight:600}
+.badge{display:inline-block;padding:1px 7px;border-radius:999px;font-size:11px;font-weight:600}
 .badge.business{background:rgba(115,218,202,.15);color:var(--business)}
 .badge.first{background:rgba(224,175,104,.18);color:var(--first)}
 .badge.stale{background:rgba(247,118,142,.15);color:var(--warn)}
 .badge.summary{background:rgba(154,163,178,.15);color:var(--muted)}
-.muted{color:var(--muted);font-size:12px;white-space:normal}
-.miles{font-weight:600;font-size:16px}
+.muted{color:var(--muted);font-size:11px;white-space:normal}
+td.miles{font-weight:600;font-size:15px}
 a{color:var(--accent);text-decoration:none}
 a:hover{text-decoration:underline}
-a.book{display:inline-block;background:var(--accent);color:#0b0e14;font-weight:600;padding:6px 14px;border-radius:8px}
+a.book{display:inline-block;background:var(--accent);color:#0b0e14;font-weight:600;padding:5px 11px;border-radius:7px;font-size:12px}
 a.book:hover{filter:brightness(1.1);text-decoration:none}
 .book-fallback{background:transparent;color:var(--accent);border:1px solid var(--accent)}
 .empty{background:var(--surface);border:1px solid var(--border);border-radius:12px;padding:28px;text-align:center;color:var(--muted)}
@@ -1131,13 +1152,19 @@ def _html_link(url: str, text: str, css_class: str = "") -> str:
 
 
 def _html_airlines(codes: Sequence[str]) -> str:
+    """Airline names only (the code is in the flight number already), each linked to the carrier."""
     if not codes:
         return "-"
-    parts = []
-    for code in codes:
-        label = f"{AIRLINE_NAMES[code]} ({code})" if code in AIRLINE_NAMES else code
-        parts.append(_html_link(airline_url(code), label))
-    return ", ".join(parts)
+    return ", ".join(_html_link(airline_url(code), AIRLINE_NAMES.get(code, code)) for code in codes)
+
+
+def _html_program(o: AwardOption) -> str:
+    short = PROGRAM_SHORT_NAMES.get(o.source, o.program)
+    return f'<span title="{_esc(o.program)}">{_esc(short)}</span>'
+
+
+def _html_duration_stops(o: AwardOption) -> str:
+    return f'{_esc(format_duration(o.duration_minutes))}<div class="muted">{_esc(format_stops(o.stops))}</div>'
 
 
 def _html_summary_cards(result: SearchResult) -> str:
@@ -1164,7 +1191,7 @@ def _html_summary_cards(result: SearchResult) -> str:
 
 
 def _html_table(result: SearchResult) -> str:
-    columns = table_columns(result.query)
+    columns = html_columns(result.query)
     head = "".join(f'<th{_css(c.css)}>{_esc(c.header)}</th>' for c in columns)
     rows = "".join(
         "<tr>" + "".join(f"<td{_css(c.css)}>{c.html(idx, o)}</td>" for c in columns) + "</tr>"
