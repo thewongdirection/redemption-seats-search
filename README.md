@@ -20,8 +20,8 @@ own Claude account, for both Claude Code on your computer and Claude Code on the
 | You provide | Why | Where to get it |
 |---|---|---|
 | A **seats.aero Pro** membership | The Partner API is only issued to Pro members | https://seats.aero/pro |
-| A **Partner API key** | Authenticates every request | seats.aero → Settings → API. Pro keys allow about 1,000 calls a day; one search uses 3–30 depending on how many programs have space |
-| `python3` 3.9 or newer | Runs the script; no packages to install | Already present on macOS and most Linux; https://python.org for Windows |
+| A **Partner API key** | Authenticates every request | seats.aero → Settings → API. Pro keys allow 1,000 calls a day; a single-date search spends 5–30, a month-long range 60–150, `--no-refresh` runs 1–40 |
+| `python3` 3.9 or newer | Runs the script; no packages to install | Already present on macOS and most Linux; https://python.org for Windows (where the command may be `python`) |
 | Outbound HTTPS to `seats.aero` | The script calls `https://seats.aero/partnerapi` | Usually nothing to do. On Claude Code on the web, see below |
 
 ### For every search
@@ -39,8 +39,11 @@ own Claude account, for both Claude Code on your computer and Claude Code on the
 | Programs | seats.aero program codes | `--sources aeroplan,united` | no, defaults to all |
 | Skip the refresh | flag; refresh is on by default (`--refresh-older-than HOURS`, `--refresh-timeout SECONDS` tune it) | `--no-refresh` | no |
 
-seats.aero caches roughly 11 months ahead. A date beyond that returns no records at all rather than an error;
-re-run once the date falls inside the window.
+seats.aero caches about 340–355 days ahead depending on the route. A date beyond that returns no records at
+all rather than an error; the report says so, and you re-run once the date falls inside the window.
+
+New users: [SETUP.md](SETUP.md) has the full checklist, the Windows equivalents, the per-search quota table
+and a troubleshooting section keyed to the exact messages the script prints.
 
 ### Fresh data on every search
 

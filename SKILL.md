@@ -22,7 +22,7 @@ result so the user can act on it.
 | Flexibility | optional | `--flex N` searches ±N days (max 7). Offer it when a date returns nothing. For a whole month or any span up to 62 days use `--date FIRST --end-date LAST` instead. |
 | Cabin | optional | Default is business **and** first. Use `--cabins first` when the user only wants first. Economy and premium economy are out of scope; the script refuses them. |
 | Nonstop only | optional | `--direct-only`. |
-| Fresh data | default on | Every search first asks seats.aero to re-scrape the matching business/first records (oldest first, up to 100) and waits up to 120s, so the report reflects what the programs show now. Each refreshed record spends one call of the 1,000/day quota; a typical search spends 5–30. Pass `--no-refresh` only when the user explicitly wants a quick cached look or is short on quota. `--refresh-older-than HOURS` narrows the refresh to older records. |
+| Fresh data | default on | Every search first asks seats.aero to re-scrape the matching business/first records (oldest first, up to 100) and waits up to 120s, so the report reflects what the programs show now. Each refreshed record spends one call of the 1,000/day quota: a single date costs 5–30 calls, a month-long range 60–150. Before running a range longer than two weeks, tell the user the rough cost and that it takes a few minutes; if they are exploring several ranges in one day, suggest `--no-refresh` for all but the one they will book from. `--refresh-older-than HOURS` narrows the refresh to older records. |
 
 If origin, destination or party size is missing, ask for it in one short message rather than guessing. A missing
 date is not a blocker: run without `--date` and explain the schedule-opening scan.
