@@ -744,6 +744,19 @@ class CrossCheckMatchingTests(unittest.TestCase):
         self.assertEqual(len(aeroplan), 1, summary.unmatched)          # detail + summary entries collapse to one line
         self.assertIn("(SQ968, NH872)", aeroplan[0])                     # flight-level detail preferred
 
+    def test_flight_match_prefers_same_program_and_never_compares_prices_across_programs(self):
+        # Aeroplan sells SQ968+NH872 at 52,500 (fixture). A United row on the same flights at 90,000 must not be
+        # told "FlightPoints quotes 52,500"; it is confirmed as seen, and Aeroplan's entry stays available.
+        united = self.make(program="United MileagePlus", source="united", mileage_cost=90000)
+        aeroplan = self.make()
+        summary = cc.match_options([united, aeroplan], self.entries())
+        self.assertEqual(united.confirmation, "flight")
+        self.assertIn("via", united.crosscheck_note)
+        self.assertNotIn("52,500", united.crosscheck_note)
+        self.assertEqual(aeroplan.confirmation, "flight")
+        self.assertEqual(aeroplan.crosscheck_note, "")
+        self.assertEqual(summary.price_disagreements, [])
+
     def test_price_disagreement_on_flight_match_is_noted_but_still_confirmed(self):
         o = self.make(mileage_cost=55000)
         cc.match_options([o], self.entries())

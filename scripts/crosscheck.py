@@ -256,13 +256,20 @@ def match_options(options: Sequence[Any], entries: Sequence[CrossCheckEntry]) ->
         numbers = flight_key((o.flight_numbers or "").split(","))
         candidates = by_flight.get((o.travel_date, o.cabin, numbers), [])
         if candidates:
-            e = candidates[0]
-            mark_used(e)
+            # The same flights can be sold by several programs at different prices, so prefer the entry
+            # from this row's own program; a different program still confirms the seat exists, but its
+            # price is not comparable and is left for the "FlightPoints also lists" note.
+            same_program = [e for e in candidates if e.source == o.source]
+            e = same_program[0] if same_program else candidates[0]
             o.sources.append("flightpoints")
             o.confirmation = "flight"
-            if e.miles and o.mileage_cost and e.miles != o.mileage_cost:
-                o.crosscheck_note = f"FlightPoints quotes {e.miles:,} miles"
-                summary.price_disagreements.append(f"{o.travel_date} {o.flight_numbers} {o.cabin}: seats.aero {o.mileage_cost:,} vs FlightPoints {e.miles:,}")
+            if same_program:
+                mark_used(e)
+                if e.miles and o.mileage_cost and e.miles != o.mileage_cost:
+                    o.crosscheck_note = f"FlightPoints quotes {e.miles:,} miles"
+                    summary.price_disagreements.append(f"{o.travel_date} {o.flight_numbers} {o.cabin} {o.program}: seats.aero {o.mileage_cost:,} vs FlightPoints {e.miles:,}")
+            else:
+                o.crosscheck_note = f"seen on FlightPoints via {e.program_label or e.source}"
             summary.flight_matches += 1
             continue
         candidates = by_program.get((o.travel_date, o.route, o.cabin, o.source), [])
