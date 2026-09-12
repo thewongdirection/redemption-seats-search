@@ -25,6 +25,10 @@ result so the user can act on it.
 
 If origin, destination, date or party size is missing, ask for it in one short message rather than guessing.
 
+Prerequisites the user must already have (see README, "What you need to provide"): a seats.aero Pro membership,
+a Partner API key in `SEATS_AERO_API_KEY` or `~/.config/seats-aero/api_key`, python3, and network access to
+`seats.aero`. If the script exits with code 2 or 3, point the user at that README section rather than improvising.
+
 ## 2. Run the search
 
 ```bash

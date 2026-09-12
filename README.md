@@ -10,11 +10,41 @@ program's booking page for that itinerary, and prints a markdown summary in the 
 
 Economy and premium economy are deliberately out of scope.
 
-## What you need
+## What you need to provide
 
-- A **seats.aero Pro** membership and a Partner API key (seats.aero → Settings). Pro keys get about 1,000
-  API calls a day; a typical search uses 3–15.
-- `python3` 3.9 or newer. The script uses only the standard library.
+### One-time setup
+
+| You provide | Why | Where to get it |
+|---|---|---|
+| A **seats.aero Pro** membership | The Partner API is only issued to Pro members | https://seats.aero/pro |
+| A **Partner API key** | Authenticates every request | seats.aero → Settings → API. Pro keys allow about 1,000 calls a day; one search uses 3–30 depending on how many programs have space |
+| `python3` 3.9 or newer | Runs the script; no packages to install | Already present on macOS and most Linux; https://python.org for Windows |
+| Outbound HTTPS to `seats.aero` | The script calls `https://seats.aero/partnerapi` | Usually nothing to do. On Claude Code on the web, see below |
+
+### For every search
+
+| Input | Format | Example | Required |
+|---|---|---|---|
+| Origin airport(s) | 3-letter IATA code, comma-separated for several | `SIN` or `LHR,LGW` | yes |
+| Destination airport(s) | same | `PEK,PKX` | yes |
+| Travel date | `YYYY-MM-DD`, today or later | `2026-11-14` | yes |
+| Passengers | 1–9 | `--pax 2` | no, defaults to 1 |
+| Date flexibility | 0–7 days either side | `--flex 3` | no, defaults to exact date |
+| Cabins | `business`, `first`, or both | `--cabins first` | no, defaults to both |
+| Nonstop only | flag | `--direct-only` | no |
+| Programs | seats.aero program codes | `--sources aeroplan,united` | no, defaults to all |
+
+seats.aero caches roughly 11 months ahead. A date beyond that returns no records at all rather than an error;
+re-run once the date falls inside the window.
+
+### Claude Code on the web
+
+Web sessions run in a sandbox whose network policy blocks most hosts by default. In the environment settings
+on claude.ai/code:
+
+1. Under **Network access**, allow `seats.aero` (or choose full access).
+2. Under **Environment variables**, add `SEATS_AERO_API_KEY` with your key so it never has to be typed in chat.
+3. Start a new session; changes apply to sessions created after the edit.
 
 ## Install the skill
 
