@@ -146,7 +146,7 @@ drive a seats.aero MCP server.
 ## Development
 
 ```bash
-./run_tests.sh              # 76 offline unit tests, network mocked
+./run_tests.sh              # 78 offline unit tests, network mocked
 ./scripts/check_secrets.sh  # credential scan
 ```
 

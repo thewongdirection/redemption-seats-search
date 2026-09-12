@@ -352,6 +352,22 @@ class RefreshTests(unittest.TestCase):
         self.assertFalse(any(u.endswith("/refresh") for u in opener.requests))
         self.assertTrue(any("No refresh needed" in n for n in result.notes))
 
+    def test_refresh_on_with_no_matches_does_not_crash(self):
+        routes = default_routes()
+        routes["search"] = {"data": [], "hasMore": False, "cursor": 0}
+        client, opener, _ = make_client(routes)
+        result = sa.run_search(client, query(refresh=True))
+        self.assertEqual(result.options, [])
+        self.assertFalse(any(u.endswith("/refresh") for u in opener.requests))
+        self.assertFalse(any("refresh" in n.lower() for n in result.notes))
+
+    def test_polling_log_is_quiet_until_progress_or_30s(self):
+        responses = iter([refresh_response({"a": "queued"}, complete=False)] + [refresh_response({"a": "processing"}, complete=False)] * 20)
+        client, _, _ = make_client({"refresh": lambda: next(responses)})
+        lines = []
+        client.refresh_and_wait(["a"], timeout_seconds=60, poll_seconds=5, log=lines.append)
+        self.assertLessEqual(len(lines), 3)   # first change (queued->processing), then every 30s
+
     def test_run_search_survives_refresh_failure(self):
         routes = default_routes()
         routes["refresh"] = lambda: http_error("x", 403, "not allowed")

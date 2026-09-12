@@ -344,6 +344,7 @@ class SeatsAeroClient:
             if not response.get("complete"):
                 pending.append(batch)
         waited = 0.0
+        last_logged = (outcome.succeeded, outcome.processing, 0.0)
         while pending and waited < timeout_seconds:
             self._sleep(poll_seconds)
             waited += poll_seconds
@@ -354,7 +355,10 @@ class SeatsAeroClient:
                 if not response.get("complete"):
                     still_pending.append(batch)
             pending = still_pending
-            log(f"refresh: {outcome.succeeded} done, {outcome.processing} in progress after {waited:.0f}s")
+            progress = (outcome.succeeded, outcome.processing)
+            if progress != last_logged[:2] or waited - last_logged[2] >= 30:
+                log(f"refresh: {outcome.succeeded} done, {outcome.processing} in progress after {waited:.0f}s")
+                last_logged = (*progress, waited)
         outcome.timed_out = bool(pending)
         outcome.waited_seconds = waited
         return outcome
@@ -405,7 +409,7 @@ class RefreshOutcome:
         if self.failed:
             parts.append(f"{self.failed} failed")
         if self.processing:
-            parts.append(f"{self.processing} still processing when the wait timed out")
+            parts.append(f"{self.processing} still processing when the wait timed out (seats.aero finishes in the background; re-run in a few minutes for the updated figures)")
         text = f"Refreshed before reporting ({self.requested} record{'s' if self.requested != 1 else ''}): " + ", ".join(parts) + "."
         if self.capped_from:
             text += f" Only the {self.requested} oldest of {self.capped_from} matches were refreshed to protect the daily quota."
@@ -606,8 +610,9 @@ def run_search(client: SeatsAeroClient, query: SearchQuery, log: Callable[[str],
         except SeatsAeroError as err:
             notes.append(f"Refresh was not possible ({err}); showing cached data as-is.")
         else:
-            if refresh_outcome is None and candidates:
-                notes.append(f"No refresh needed: every matching record was already newer than {query.refresh_older_than_hours:g}h.")
+            if refresh_outcome is None:
+                if candidates:
+                    notes.append(f"No refresh needed: every matching record was already newer than {query.refresh_older_than_hours:g}h.")
             else:
                 notes.append(refresh_outcome.summary())
                 if refresh_outcome.succeeded or refresh_outcome.processing:
