@@ -485,7 +485,7 @@ def _trip_options(availability: dict[str, Any], payload: dict[str, Any], query: 
                 cabin=cabin,
                 travel_date=str(availability.get("Date", query.travel_date.isoformat())),
                 route=route,
-                airlines=_split_codes(trip.get("Carriers")),
+                airlines=_unique(_split_codes(trip.get("Carriers"))),
                 flight_numbers=_normalise_flight_numbers(trip.get("FlightNumbers")),
                 departs_at=str(trip.get("DepartsAt", "")),
                 arrives_at=str(trip.get("ArrivesAt", "")),
@@ -521,7 +521,7 @@ def _summary_options(availability: dict[str, Any], cabins_open: Sequence[str], q
                 cabin=cabin,
                 travel_date=str(availability.get("Date", query.travel_date.isoformat())),
                 route=_route_label(availability, query),
-                airlines=_split_codes(availability.get(f"{code}Airlines")),
+                airlines=_unique(_split_codes(availability.get(f"{code}Airlines"))),
                 flight_numbers=reason or "see program site",
                 departs_at="",
                 arrives_at="",
@@ -576,6 +576,11 @@ def _split_codes(value: Any) -> list[str]:
     if not value:
         return []
     return [part.strip() for part in str(value).replace(";", ",").split(",") if part.strip()]
+
+
+def _unique(items: Sequence[str]) -> list[str]:
+    """Order-preserving de-duplication; seats.aero repeats the carrier once per segment ("VN, VN")."""
+    return list(dict.fromkeys(items))
 
 
 def _normalise_flight_numbers(value: Any) -> str:

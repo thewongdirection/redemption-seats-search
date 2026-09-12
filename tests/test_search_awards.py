@@ -158,6 +158,17 @@ class TripEnrichmentTests(unittest.TestCase):
         self.assertTrue(best.booking_link.startswith("https://www.aircanada.com/"))
         self.assertEqual(best.detail_level, "trip")
 
+    def test_repeated_carrier_codes_are_collapsed(self):
+        routes = default_routes()
+        trips = load_fixture("trips_aeroplan.json")
+        trips["data"][1]["Carriers"] = "VN, VN"
+        routes["trips/avail-aeroplan-1"] = trips
+        client, _, _ = make_client(routes)
+        result = sa.run_search(client, query())
+        onestop = next(o for o in result.options if o.trip_id == "trip-aeroplan-onestop")
+        self.assertEqual(onestop.airlines, ["VN"])
+        self.assertEqual(sa.format_airlines(onestop.airlines), "Vietnam Airlines (VN)")
+
     def test_segments_are_ordered_by_order_field(self):
         client, _, _ = make_client(default_routes())
         result = sa.run_search(client, query())
