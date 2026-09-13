@@ -1144,5 +1144,145 @@ class MainEntryPointTests(unittest.TestCase):
             self.assertIn("No seats.aero API key", err.getvalue())
 
 
+# --------------------------------------------------------------------------- nonstop-only, program-level rows
+
+
+def summary_only_availability(direct: bool, source: str = "aeroplan") -> dict:
+    """One availability record with business space and no trip detail behind it."""
+    return {
+        "ID": f"avail-{source}-{'direct' if direct else 'connecting'}",
+        "Date": "2026-11-14",
+        "Source": source,
+        "Route": {"OriginAirport": "SIN", "DestinationAirport": "LHR"},
+        "JAvailable": True,
+        "JMileageCost": "60000",
+        "JRemainingSeats": 2,
+        "JAirlines": "SQ",
+        "JDirect": direct,
+        "JTotalTaxes": 5000,
+        "TaxesCurrency": "SGD",
+        "UpdatedAt": "2026-11-01T00:00:00Z",
+    }
+
+
+class DirectOnlySummaryRowTests(unittest.TestCase):
+    """--direct-only must hold for program-level rows too, not just itineraries with flight numbers."""
+
+    def run_with(self, records: list[dict], **overrides):
+        routes = {"search": {"data": records, "hasMore": False, "cursor": 0}}
+        client, _, _ = make_client(routes)
+        return sa.run_search(client, query(max_trip_lookups=0, **overrides))
+
+    def test_connecting_program_row_is_dropped_when_nonstop_only(self):
+        result = self.run_with([summary_only_availability(direct=False)], direct_only=True)
+        self.assertEqual(result.options, [])
+        self.assertEqual(result.premium_matches, 1)
+        self.assertIn("nonstop routing", result.explain_no_results())
+
+    def test_direct_program_row_survives_and_reports_nonstop(self):
+        result = self.run_with([summary_only_availability(direct=True)], direct_only=True)
+        self.assertEqual([(o.detail_level, o.stops) for o in result.options], [("summary", 0)])
+
+    def test_without_the_flag_a_connecting_program_row_is_kept_with_an_unknown_stop_count(self):
+        result = self.run_with([summary_only_availability(direct=False)])
+        self.assertEqual([(o.detail_level, o.stops) for o in result.options], [("summary", -1)])
+        self.assertEqual(sa.format_stops(result.options[0].stops), "?")
+
+    def test_mixed_records_keep_only_the_nonstop_one(self):
+        result = self.run_with(
+            [summary_only_availability(direct=False, source="united"), summary_only_availability(direct=True)],
+            direct_only=True,
+        )
+        self.assertEqual([o.source for o in result.options], ["aeroplan"])
+
+
+# --------------------------------------------------------------------------- FlightPoints output captured live
+
+
+LIVE_FIXTURES = FIXTURES / "live"
+
+
+class LiveFlightPointsFormatTests(unittest.TestCase):
+    """Parsing checked against tool output captured from FlightPoints in September 2026.
+
+    The search capture is verbatim; the details capture keeps 4 of 48 itineraries and the
+    CDG-LAX capture keeps 2 of 15 results-table rows, so the files stay a readable size.
+    """
+
+    def test_live_search_output_parses_into_premium_entries(self):
+        entries = cc.parse_text((LIVE_FIXTURES / "search_jfk_ams_2026-10-15.txt").read_text(encoding="utf-8"))
+        premium = [e for e in entries if e.cabin in ("business", "first")]
+        self.assertEqual(len(premium), 12)
+        self.assertTrue(all(e.date == "2026-10-15" and e.route == "JFK-AMS" for e in premium))
+        aeroplan = next(e for e in premium if e.source == "aeroplan")
+        self.assertEqual((aeroplan.cabin, aeroplan.miles, aeroplan.taxes_usd), ("business", 58800, 141.0))
+        # A program FlightPoints lists that seats.aero does not track stays verbatim and simply never matches.
+        self.assertIn("miles&go", {e.source for e in entries})
+
+    def test_live_details_output_yields_flight_numbers_and_ignores_premium_economy(self):
+        entries = cc.parse_text((LIVE_FIXTURES / "details_ac_jfk_ams_2026-10-15.txt").read_text(encoding="utf-8"))
+        business = [e for e in entries if e.cabin == "business"]
+        self.assertEqual([e.flight_numbers for e in business], [("LO27", "LO267"), ("EK206", "LH257", "LH986")])
+        self.assertEqual([e.miles for e in business], [75000, 58800])
+        self.assertTrue(all(e.source == "aeroplan" for e in business))
+        self.assertNotIn("premium", {e.cabin for e in entries})   # "Prem. Eco." lines are out of scope
+
+    def test_live_empty_search_is_an_answer_not_an_unreadable_file(self):
+        text = (LIVE_FIXTURES / "search_eze_hkg_2027-05-14_empty.txt").read_text(encoding="utf-8")
+        self.assertEqual(cc.parse_text(text), [])
+        self.assertTrue(cc.is_empty_result(text))
+
+    def test_flightpoints_display_names_map_onto_seats_aero_programs(self):
+        seen_live = {
+            "AAdvantage": "american", "Aeroplan": "aeroplan", "Atmos Rewards": "alaska", "Flying Blue": "flyingblue",
+            "SkyMiles": "delta", "TrueBlue": "jetblue", "Etihad Guest": "etihad", "Miles & More": "lufthansa",
+            "Frequent Flyer": "qantas", "Privilege Club / Avios": "qatar", "MileagePlus": "united",
+            "Miles&Smiles": "turkish", "Aeromexico Rewards": "aeromexico", "Smiles": "smiles",
+            "Flying Club": "virginatlantic", "Velocity Frequent Flyer": "velocity",
+        }
+        for label, source in seen_live.items():
+            with self.subTest(label=label):
+                self.assertEqual(cc.source_for_program(label), source)
+                self.assertIn(source, sa.PROGRAM_NAMES)
+
+    def test_velocity_rows_confirm_instead_of_reading_as_missing_from_seats_aero(self):
+        entry = cc.parse_text(
+            "Award Flight Search: SYD → LAX\nDate: 2026-11-14  |  Cabin: Business\n\n"
+            "Premium cabins (points):\n- Velocity Frequent Flyer: Biz 95,000+$289\n"
+        )
+        self.assertEqual([e.source for e in entry], ["velocity"])
+        option = sa.AwardOption(
+            program="Virgin Australia Velocity", source="velocity", cabin="business", travel_date="2026-11-14",
+            route="SYD-LAX", airlines=["VA"], flight_numbers="see program site", departs_at="", arrives_at="",
+            duration_minutes=0, stops=0, remaining_seats=2, mileage_cost=95000, taxes_minor_units=0,
+            taxes_currency="AUD", booking_link="",
+        )
+        summary = cc.match_options([option], entry)
+        self.assertEqual((summary.program_matches, summary.unmatched), (1, []))
+        self.assertEqual(option.confirmation, "program")
+
+
+# --------------------------------------------------------------------------- batch matrix
+
+
+class BatchMatrixTests(unittest.TestCase):
+    """A small slice of tests/batch_matrix.py, so the batch harness itself stays working.
+
+    The full sweep (10 routes x 10 months) is run from the command line:
+        python3 tests/batch_matrix.py --routes 10 --months 10 --pax 2
+    """
+
+    def test_small_matrix_passes_every_invariant(self):
+        sys.path.insert(0, str(ROOT / "tests"))
+        import batch_matrix
+
+        with tempfile.TemporaryDirectory() as tmp:
+            failures, coverage = batch_matrix.run_matrix(
+                routes=2, months=2, pax=2, seed="unit-test", workdir=Path(tmp) / "reports")
+        self.assertEqual(failures, [])
+        self.assertEqual(coverage["scenarios"], 4)
+        self.assertGreater(coverage["options"], 0)
+
+
 if __name__ == "__main__":
     unittest.main()

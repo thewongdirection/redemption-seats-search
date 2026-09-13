@@ -189,9 +189,26 @@ drive a seats.aero MCP server.
 ## Development
 
 ```bash
-./run_tests.sh              # 110 offline unit tests, network mocked
+./run_tests.sh              # 120 offline unit tests, network mocked
 ./scripts/check_secrets.sh  # credential scan
 ```
+
+### Batch testing a matrix of routes and months
+
+`tests/batch_matrix.py` drives the real command line against a simulated Partner API
+(`tests/fake_seats_aero.py`) for a random draw of routes across consecutive months, and checks the
+invariants a user relies on: the cabin, date-window and party-size filters hold, rows are ordered by
+price, the HTML report is self-contained and escapes hostile text, the API key never reaches any
+output, and the markdown re-render agrees with the JSON. It also runs the option variants
+(`--direct-only`, `--cabins first`, `--sources`, `--no-refresh`, `--flex`, `--max-trip-lookups 0`),
+the input checks and a cross-check against FlightPoints output captured live.
+
+```bash
+python3 tests/batch_matrix.py --routes 10 --months 10 --pax 2   # 100 searches, no key, no network
+```
+
+Exit code 0 means every scenario passed; failures are listed in the JSON it prints. `run_tests.sh`
+runs a 2x2 slice of the same harness so it stays working.
 
 ## Layout
 
@@ -204,7 +221,7 @@ CLAUDE.md                    points Claude at SKILL.md in web sessions on this r
 scripts/search_awards.py     the search tool (seats.aero)
 scripts/check_secrets.sh     credential scanner
 references/                  API notes and MCP alternative
-tests/                       regression suite and API fixtures
+tests/                       regression suite, API fixtures, batch matrix harness
 award-reports/               generated HTML reports (git-ignored)
 .github/workflows/ci.yml     runs the scan and tests on every push
 ```

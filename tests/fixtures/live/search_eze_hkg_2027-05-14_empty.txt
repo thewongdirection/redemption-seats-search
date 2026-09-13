@@ -1,0 +1,6 @@
+Award Flight Search: EZE → HKG
+Date: 2027-05-14  |  Cabin: Business  |  Passengers: 2
+
+Search complete. Found 0 award flight option(s).
+
+No flights found matching your criteria.

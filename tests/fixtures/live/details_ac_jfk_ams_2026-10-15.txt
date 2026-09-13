@@ -1,0 +1,47 @@
+Found 48 detailed flight option(s).
+
+1. [AC](https://flightpoints.com/i/eJxzdK7xcvOucfQNrjEyMDLTNTTQNTQFAETmBaA): JFK → AMS
+   Departs: 2026-10-15 21:50:00  |  Arrives: 2026-10-16 17:45:00  |  Duration: 9h 5m
+   Routing: 1 stop(s)
+   Economy: 42,500 pts + 122.01000 taxes  |  6 seat(s)
+   Segments:
+     1. JFK → FRA  LH405 (Lufthansa)  ·  Airbus A340-300  ·  2026-10-15T21:50:00Z → 2026-10-16T11:45:00Z
+     2. FRA → AMS  LH996 (Lufthansa)  ·  Airbus A320Neo  ·  2026-10-16T16:35:00Z → 2026-10-16T17:45:00Z
+   View on FlightPoints → https://flightpoints.com/i/eJxzdK7xcvOucfQNrjEyMDLTNTTQNTQFAETmBaA
+   Book: https://www.aircanada.com/aeroplan/redeem/availability/outbound?org0=JFK&dest0=AMS&departureDate0=2026-10-15&lang=en-US&tripType=O&ADT=1&YTH=0&CHD=0&INF=0&INS=0&marketCode=INT
+
+5. [AC](https://flightpoints.com/i/eJxzdK7xcvOucfQNrjEyMDLTNTTQNTQFAETmBaA): JFK → AMS
+   Departs: 2026-10-15 22:20:00  |  Arrives: 2026-10-16 18:50:00  |  Duration: 10h 45m
+   Routing: 1 stop(s)
+   Economy: 42,500 pts + 100.51000 taxes  |  7 seat(s)
+   Business: 75,000 pts + 100.51000 taxes  |  1 seat(s)
+   Segments:
+     1. JFK → WAW  LO27 (LOT Polish Airlines)  ·  Boeing 777-200/200Er  ·  2026-10-15T22:20:00Z → 2026-10-16T13:00:00Z
+     2. WAW → AMS  LO267 (LOT Polish Airlines)  ·  Embraer 195  ·  2026-10-16T16:45:00Z → 2026-10-16T18:50:00Z
+   View on FlightPoints → https://flightpoints.com/i/eJxzdK7xcvOucfQNrjEyMDLTNTTQNTQFAETmBaA
+   Book: https://www.aircanada.com/aeroplan/redeem/availability/outbound?org0=JFK&dest0=AMS&departureDate0=2026-10-15&lang=en-US&tripType=O&ADT=1&YTH=0&CHD=0&INF=0&INS=0&marketCode=INT
+
+8. [AC](https://flightpoints.com/i/eJxzdK7xcvOucfQNrjEyMDLTNTTQNTQFAETmBaA): JFK → AMS
+   Departs: 2026-10-15 22:20:00  |  Arrives: 2026-10-17 08:00:00  |  Duration: 10h 25m
+   Routing: 2 stop(s)
+   Economy: 47,900 pts + 143.51000 taxes  |  9 seat(s)
+   Prem. Eco.: 85,000 pts + 143.51000 taxes  |  2 seat(s)
+   Segments:
+     1. JFK → MXP  EK206 (Emirates)  ·  Airbus A380-800  ·  2026-10-15T22:20:00Z → 2026-10-16T12:15:00Z
+     2. LIN → FRA  LH279 (Lufthansa)  ·  Embraer 190  ·  2026-10-16T19:25:00Z → 2026-10-16T20:45:00Z
+     3. FRA → AMS  LH986 (Lufthansa)  ·  Airbus A320Neo  ·  2026-10-17T06:50:00Z → 2026-10-17T08:00:00Z
+   View on FlightPoints → https://flightpoints.com/i/eJxzdK7xcvOucfQNrjEyMDLTNTTQNTQFAETmBaA
+   Book: https://www.aircanada.com/aeroplan/redeem/availability/outbound?org0=JFK&dest0=AMS&departureDate0=2026-10-15&lang=en-US&tripType=O&ADT=1&YTH=0&CHD=0&INF=0&INS=0&marketCode=INT
+
+29. [AC](https://flightpoints.com/i/eJxzdK7xcvOucfQNrjEyMDLTNTTQNTQFAETmBaA): JFK → AMS
+   Departs: 2026-10-15 22:20:00  |  Arrives: 2026-10-17 08:00:00  |  Duration: 10h 25m
+   Routing: 2 stop(s)
+   Economy: 47,900 pts + 140.91000 taxes  |  9 seat(s)
+   Prem. Eco.: 85,000 pts + 140.91000 taxes  |  2 seat(s)
+   Business: 58,800 pts + 140.91000 taxes  |  9 seat(s)
+   Segments:
+     1. JFK → MXP  EK206 (Emirates)  ·  Airbus A380-800  ·  2026-10-15T22:20:00Z → 2026-10-16T12:15:00Z
+     2. MXP → FRA  LH257 (Lufthansa)  ·  Airbus A320  ·  2026-10-16T19:30:00Z → 2026-10-16T20:50:00Z
+     3. FRA → AMS  LH986 (Lufthansa)  ·  Airbus A320Neo  ·  2026-10-17T06:50:00Z → 2026-10-17T08:00:00Z
+   View on FlightPoints → https://flightpoints.com/i/eJxzdK7xcvOucfQNrjEyMDLTNTTQNTQFAETmBaA
+   Book: https://www.aircanada.com/aeroplan/redeem/availability/outbound?org0=JFK&dest0=AMS&departureDate0=2026-10-15&lang=en-US&tripType=O&ADT=1&YTH=0&CHD=0&INF=0&INS=0&marketCode=INT

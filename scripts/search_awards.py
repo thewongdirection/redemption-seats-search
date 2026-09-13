@@ -761,6 +761,11 @@ def _summary_options(availability: dict[str, Any], cabins_open: Sequence[str], q
     options = []
     for cabin in cabins_open:
         code = CABIN_CODES[cabin]
+        direct = bool(availability.get(f"{code}Direct"))
+        if query.direct_only and not direct:
+            # seats.aero says this record's space in this cabin needs a connection, so a
+            # nonstop-only search must drop it rather than show it with an unknown stop count.
+            continue
         seats = _to_int(availability.get(f"{code}RemainingSeats"))
         if 0 < seats < query.pax:
             continue
@@ -776,7 +781,7 @@ def _summary_options(availability: dict[str, Any], cabins_open: Sequence[str], q
                 departs_at="",
                 arrives_at="",
                 duration_minutes=0,
-                stops=-1 if not availability.get(f"{code}Direct") else 0,
+                stops=0 if direct else -1,
                 remaining_seats=seats,
                 mileage_cost=_availability_cost(availability, cabin),
                 taxes_minor_units=_to_int(availability.get(f"{code}TotalTaxes")),

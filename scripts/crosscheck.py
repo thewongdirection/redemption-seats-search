@@ -34,7 +34,7 @@ PROGRAM_NAME_TO_SOURCE = {
     "frequent flyer": "qantas", "privilege club / avios": "qatar", "privilege club": "qatar", "mileageplus": "united",
     "krisflyer": "singapore", "flying blue": "flyingblue", "flying club": "virginatlantic", "trueblue": "jetblue",
     "skymiles": "delta", "skywards": "emirates", "etihad guest": "etihad", "miles & more": "lufthansa",
-    "velocity": "velocity", "eurobonus": "eurobonus", "finnair plus": "finnair", "smiles": "smiles",
+    "velocity": "velocity", "velocity frequent flyer": "velocity", "eurobonus": "eurobonus", "finnair plus": "finnair", "smiles": "smiles",
     "executive club": "british", "british airways club": "british", "miles&smiles": "turkish",
     "aeromexico rewards": "aeromexico", "connectmiles": "connectmiles", "tudoazul": "azul", "shebamiles": "ethiopian",
     "alfursan": "saudia", "frontier miles": "frontier", "free spirit": "spirit",

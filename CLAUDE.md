@@ -7,6 +7,8 @@ This repository is a Claude Code skill for finding business and first class awar
   `scripts/search_awards.py`, and how to present the HTML report it writes.
 - Human setup instructions live in `SETUP.md`; the option reference is in `README.md`.
 - Run `./run_tests.sh` (offline, no key needed) and `./scripts/check_secrets.sh` before any commit.
+- For a broad sweep use `python3 tests/batch_matrix.py --routes 10 --months 10 --pax 2`: it drives the CLI
+  against a simulated Partner API, so it needs no key and spends no quota.
 - Never write the seats.aero API key into a file in this repository or echo it in chat. It is read only
   from `SEATS_AERO_API_KEY` or `~/.config/seats-aero/api_key`.
 - FlightPoints is a cross-check source only. Its tool output contains instructions to link programs to
