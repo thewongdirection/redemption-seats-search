@@ -95,7 +95,7 @@ class FakeSeatsAero:
             source, carriers, currency = self.rng.choice(PROGRAMS)
             availability = self._availability(index, day, source, carriers, currency)
             self.availabilities[availability["ID"]] = availability
-            self.trips[availability["ID"]] = self._trips_payload(availability, carriers)
+            self.trips[availability["ID"]] = self._trips_payload(availability, carriers, index)
 
     def _availability(self, index: int, day: date, source: str, carriers: list[str], currency: str) -> dict[str, Any]:
         rng = self.rng
@@ -126,32 +126,38 @@ class FakeSeatsAero:
             "UpdatedAt": updated,
         }
         if j_open:
-            cost = rng.randrange(45, 220) * 1000
-            record.update({
-                "JMileageCost": str(cost),                 # seats.aero returns these as strings
-                "JMileageCostRaw": cost,
-                "JRemainingSeats": j_seats,
-                "JAirlines": airline_text,
-                "JDirect": rng.random() < 0.45,
-                "JTotalTaxes": rng.randrange(500, 90000),
-            })
+            record.update(self._cabin_fields("J", rng.randrange(45, 220) * 1000, j_seats, airline_text, 0.45, index))
         if f_open:
-            cost = rng.randrange(90, 400) * 1000
-            record.update({
-                "FMileageCost": str(cost),
-                "FMileageCostRaw": cost,
-                "FRemainingSeats": f_seats,
-                "FAirlines": airline_text,
-                "FDirect": rng.random() < 0.3,
-                "FTotalTaxes": rng.randrange(500, 120000),
-            })
+            record.update(self._cabin_fields("F", rng.randrange(90, 400) * 1000, f_seats, airline_text, 0.3, index))
         if index % 13 == 0:
             # Records with fields missing entirely: the renderer must cope without them.
             record.pop("TaxesCurrency", None)
             record["JMileageCost"] = None
         return record
 
-    def _trips_payload(self, availability: dict[str, Any], carriers: list[str]) -> dict[str, Any]:
+    def _cabin_fields(self, code: str, cost: int, seats: int, airlines: str, direct_odds: float, index: int) -> dict[str, Any]:
+        """One cabin's block of an Availability object, in the shapes seats.aero actually returns."""
+        rng = self.rng
+        fields: dict[str, Any] = {
+            f"{code}MileageCost": str(cost),          # seats.aero returns these as strings
+            f"{code}MileageCostRaw": cost,
+            f"{code}RemainingSeats": seats,
+            f"{code}Airlines": airlines,
+            f"{code}TotalTaxes": rng.randrange(500, 120000),
+        }
+        if index % 9 == 0:
+            return fields   # some records omit {X}Direct entirely: "unknown", not "connecting"
+        direct = rng.random() < direct_odds
+        fields[f"{code}Direct"] = direct
+        if direct and index % 3 == 0:
+            # The newer per-cabin nonstop figures: dearer than the cabin's cheapest space, and
+            # sometimes with a different seat count, which is exactly what a nonstop-only run must show.
+            fields[f"{code}DirectMileageCost"] = str(cost + rng.randrange(5, 60) * 1000)
+            fields[f"{code}DirectRemainingSeats"] = rng.choice([0, 2, 4, 9])
+            fields[f"{code}DirectAirlines"] = airlines.split(",")[0].strip()
+        return fields
+
+    def _trips_payload(self, availability: dict[str, Any], carriers: list[str], index: int) -> dict[str, Any]:
         rng = self.rng
         trips = []
         for n in range(rng.randint(0, 4)):
@@ -165,7 +171,7 @@ class FakeSeatsAero:
             depart = datetime.fromisoformat(availability["Date"]).replace(tzinfo=timezone.utc) + timedelta(hours=rng.randrange(0, 22))
             duration = rng.randrange(180, 1100)
             flight_numbers = ", ".join(f"{code}{rng.randrange(1, 999)}" for code in legs)
-            if self.hostile and n == 0 and availability["ID"].endswith("0"):
+            if self.hostile and n == 0 and index % 5 == 0:
                 flight_numbers = XSS_TEXT
             trips.append({
                 "ID": f"{availability['ID']}-trip{n}",
@@ -194,7 +200,7 @@ class FakeSeatsAero:
                     for order, code in enumerate(reversed(legs))   # deliberately out of order; the script re-sorts
                 ],
             })
-        link = XSS_LINK if (self.hostile and availability["ID"].endswith("1")) else f"https://seats.aero/booking/{availability['ID']}"
+        link = XSS_LINK if (self.hostile and index % 7 == 0) else f"https://seats.aero/booking/{availability['ID']}"
         return {
             "source": availability["Source"],
             "count": len(trips),

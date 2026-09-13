@@ -675,6 +675,13 @@ def run_search(client: SeatsAeroClient, query: SearchQuery, log: Callable[[str],
         notes.append(f"Some results are cached data older than {STALE_AFTER_HOURS}h (see Updated column); re-verify on the program's site before transferring points.")
     if query.pax > 1:
         notes.append(f"Filtered to itineraries reporting at least {query.pax} seats; programs that hide seat counts are kept and flagged.")
+    if query.direct_only:
+        unknown = sum(1 for o in options if o.stops < 0)
+        note = "Filtered to nonstop itineraries; anything seats.aero reports as connecting was dropped."
+        if unknown:
+            note += (f" {unknown} program-level row(s) are shown with '?' stops because seats.aero publishes no "
+                     "nonstop flag for them; confirm on the program's site.")
+        notes.append(note)
     if query.date_mode == "schedule-opening":
         notes.append(f"No date was given, so this scanned {SCHEDULE_OPENING_DAYS[0]}-{SCHEDULE_OPENING_DAYS[1]} days out, where airlines first release award inventory.")
 
@@ -702,8 +709,13 @@ def _cheapest_premium_cost(availability: dict[str, Any], cabins: Sequence[str]) 
     return min((c for c in costs if c > 0), default=10**9)
 
 
-def _availability_cost(availability: dict[str, Any], cabin: str) -> int:
+def _availability_cost(availability: dict[str, Any], cabin: str, direct: bool = False) -> int:
+    """Cheapest price the record reports for the cabin; with direct=True, for its nonstop space."""
     code = CABIN_CODES[cabin]
+    if direct:
+        nonstop = _to_int(availability.get(f"{code}DirectMileageCost"))
+        if nonstop > 0:
+            return nonstop
     raw = availability.get(f"{code}MileageCostRaw")
     if isinstance(raw, int) and raw > 0:
         return raw
@@ -755,18 +767,31 @@ def _trip_options(availability: dict[str, Any], payload: dict[str, Any], query: 
     return options
 
 
+def _cabin_field(availability: dict[str, Any], code: str, name: str, direct: bool) -> Any:
+    """Read {X}Direct<name> when a nonstop-only search asked for it, else {X}<name>."""
+    if direct:
+        value = availability.get(f"{code}Direct{name}")
+        if value not in (None, "", 0):
+            return value
+    return availability.get(f"{code}{name}")
+
+
 def _summary_options(availability: dict[str, Any], cabins_open: Sequence[str], query: SearchQuery, reason: str = "") -> list[AwardOption]:
     """Program-level rows built from the Availability object alone (no flight numbers)."""
     source = availability.get("Source", "")
     options = []
     for cabin in cabins_open:
         code = CABIN_CODES[cabin]
-        direct = bool(availability.get(f"{code}Direct"))
-        if query.direct_only and not direct:
-            # seats.aero says this record's space in this cabin needs a connection, so a
-            # nonstop-only search must drop it rather than show it with an unknown stop count.
+        # Absent means seats.aero did not say either way (it omits {X}Direct on some records),
+        # which is not the same as "needs a connection".
+        direct = availability.get(f"{code}Direct")
+        if query.direct_only and direct is False:
             continue
-        seats = _to_int(availability.get(f"{code}RemainingSeats"))
+        # A nonstop-only report must quote the nonstop space, not the cabin's cheapest space,
+        # which may well be a connection. These {X}Direct* fields are newer and can be missing,
+        # so each falls back to the cabin-wide figure.
+        nonstop_only = bool(query.direct_only and direct)
+        seats = _to_int(_cabin_field(availability, code, "RemainingSeats", nonstop_only))
         if 0 < seats < query.pax:
             continue
         options.append(
@@ -776,14 +801,14 @@ def _summary_options(availability: dict[str, Any], cabins_open: Sequence[str], q
                 cabin=cabin,
                 travel_date=str(availability.get("Date", query.start_date.isoformat())),
                 route=_route_label(availability, query),
-                airlines=_unique(_split_codes(availability.get(f"{code}Airlines"))),
+                airlines=_unique(_split_codes(_cabin_field(availability, code, "Airlines", nonstop_only))),
                 flight_numbers=reason or "see program site",
                 departs_at="",
                 arrives_at="",
                 duration_minutes=0,
                 stops=0 if direct else -1,
                 remaining_seats=seats,
-                mileage_cost=_availability_cost(availability, cabin),
+                mileage_cost=_availability_cost(availability, cabin, direct=nonstop_only),
                 taxes_minor_units=_to_int(availability.get(f"{code}TotalTaxes")),
                 taxes_currency=str(availability.get("TaxesCurrency") or ""),
                 booking_link="",

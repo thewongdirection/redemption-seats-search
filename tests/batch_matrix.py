@@ -29,6 +29,7 @@ from typing import Any, Callable, Iterator, Sequence
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "scripts"))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
+import crosscheck  # noqa: E402
 import fake_seats_aero  # noqa: E402
 import search_awards  # noqa: E402
 
@@ -113,6 +114,8 @@ def _fake_api(api: fake_seats_aero.FakeSeatsAero | None) -> Iterator[None]:
             kwargs.pop("sleep", None)
             return real_client(api_key, opener=api.opener, sleep=lambda _seconds: None, **kwargs)
         search_awards.SeatsAeroClient = factory  # type: ignore[assignment]
+    # resolve_api_key reads SEATS_AERO_API_KEY first, so setting it wins over any SEATS_API_KEY
+    # the shell happens to carry; that one is deliberately left alone.
     previous_key = os.environ.get("SEATS_AERO_API_KEY")
     os.environ["SEATS_AERO_API_KEY"] = TEST_API_KEY
     try:
@@ -296,8 +299,11 @@ def run_scenario(scenario: Scenario, workdir: Path, now: datetime) -> tuple[list
     if scenario.pax > 1 and options:
         check(f"at least {scenario.pax} seats" in notes, "the party-size filter was not explained in the notes")
 
-    keys = [(0 if opt.get("confirmation") else 2, opt.get("mileage_cost") or 10**9, opt.get("taxes_minor_units", 0)) for opt in options]
-    check(keys == sorted(keys), "rows are not ordered by confirmation, then miles, then taxes")
+    # No cross-check runs here, so every row ranks the same; the flight-before-program part of the
+    # ordering is covered in run_cross_check_checks.
+    keys = [(crosscheck.CONFIRMATION_RANK.get(opt.get("confirmation", ""), 2),
+             opt.get("mileage_cost") or 10**9, opt.get("taxes_minor_units", 0)) for opt in options]
+    check(keys == sorted(keys), "rows are not ordered by miles, then taxes")
 
     identities = [(opt.get("trip_id"), opt.get("cabin")) for opt in options if opt.get("trip_id")]
     check(len(identities) == len(set(identities)), "the same itinerary appears more than once")
@@ -392,7 +398,7 @@ def run_variant(name: str, extra: list[str], origin: str, destination: str, wind
     if name == "two-programs":
         present = sorted({record["Source"] for record in api.availabilities.values()})
         wanted_sources = present[:2]
-        extra = ["--sources", ",".join(wanted_sources)]
+        extra = extra + ["--sources", ",".join(wanted_sources)]
     argv += extra
     code, stdout, stderr = run_cli(argv, api, workdir)
     check(code == 0, f"exit code {code} ({stderr.strip()[:160]})")
@@ -403,9 +409,19 @@ def run_variant(name: str, extra: list[str], origin: str, destination: str, wind
     check(bool(options), "the variant produced no rows at all, so it proves nothing")
 
     if name in ("direct-only", "direct-first"):
-        offenders = [o for o in options if o["stops"] != 0]
+        offenders = [o for o in options if o["stops"] > 0]
         example = f" (e.g. {offenders[0]['program']} {offenders[0]['travel_date']} stops={offenders[0]['stops']})" if offenders else ""
-        check(not offenders, f"{len(offenders)} row(s) are not nonstop despite --direct-only{example}")
+        check(not offenders, f"{len(offenders)} row(s) are connecting despite --direct-only{example}")
+        # A "?" row is only allowed where seats.aero itself did not say whether the space is nonstop.
+        for option in [o for o in options if o["stops"] < 0]:
+            record = api.availabilities.get(option["availability_id"], {})
+            code = search_awards.CABIN_CODES[option["cabin"]]
+            check(f"{code}Direct" not in record,
+                  f"{option['program']} {option['travel_date']} shows an unknown stop count although the record says "
+                  f"{code}Direct={record.get(f'{code}Direct')}")
+        if any(o["stops"] < 0 for o in options):
+            check(any("no nonstop flag" in note for note in payload["notes"]),
+                  "rows with an unknown stop count were not explained in the notes")
     if name in ("first-only", "direct-first"):
         offenders = [o for o in options if o["cabin"] != "first"]
         check(not offenders, f"{len(offenders)} row(s) are not first class despite --cabins first")
@@ -521,7 +537,8 @@ def run_cross_check_checks(workdir: Path) -> list[str]:
     summary = payload.get("crosscheck") or {}
     options = payload["options"]
 
-    check(summary.get("files", 0) == len(list(LIVE_FIXTURES.iterdir())), "not every capture in the directory was read")
+    captures = [path for path in LIVE_FIXTURES.iterdir() if path.is_file()]   # load_files reads files, not subdirectories
+    check(summary.get("files", 0) == len(captures), "not every capture in the directory was read")
     check(summary.get("empty_files", 0) == 1, "the capture where FlightPoints found nothing was not recognised as an answer")
     check(summary.get("flight_matches", 0) >= 1, "the row sharing flight numbers with the captures was not confirmed by flight")
     check(summary.get("program_matches", 0) >= 1, "the row sharing program and price with the captures was not confirmed")

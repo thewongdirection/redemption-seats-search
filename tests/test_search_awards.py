@@ -19,6 +19,7 @@ from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "scripts"))
+sys.path.insert(0, str(ROOT / "tests"))
 
 import search_awards as sa  # noqa: E402
 
@@ -1147,9 +1148,12 @@ class MainEntryPointTests(unittest.TestCase):
 # --------------------------------------------------------------------------- nonstop-only, program-level rows
 
 
-def summary_only_availability(direct: bool, source: str = "aeroplan") -> dict:
-    """One availability record with business space and no trip detail behind it."""
-    return {
+def summary_only_availability(direct: bool | None, source: str = "aeroplan", **extra) -> dict:
+    """One availability record with business space and no trip detail behind it.
+
+    direct=None leaves JDirect out, the way seats.aero omits it on some records.
+    """
+    record = {
         "ID": f"avail-{source}-{'direct' if direct else 'connecting'}",
         "Date": "2026-11-14",
         "Source": source,
@@ -1157,12 +1161,15 @@ def summary_only_availability(direct: bool, source: str = "aeroplan") -> dict:
         "JAvailable": True,
         "JMileageCost": "60000",
         "JRemainingSeats": 2,
-        "JAirlines": "SQ",
-        "JDirect": direct,
+        "JAirlines": "SQ, LH",
         "JTotalTaxes": 5000,
         "TaxesCurrency": "SGD",
         "UpdatedAt": "2026-11-01T00:00:00Z",
     }
+    if direct is not None:
+        record["JDirect"] = direct
+    record.update(extra)
+    return record
 
 
 class DirectOnlySummaryRowTests(unittest.TestCase):
@@ -1194,6 +1201,41 @@ class DirectOnlySummaryRowTests(unittest.TestCase):
             direct_only=True,
         )
         self.assertEqual([o.source for o in result.options], ["aeroplan"])
+
+    def test_a_record_with_no_direct_flag_is_kept_and_marked_unknown(self):
+        # seats.aero omits {X}Direct on some records; that is "it did not say", not "connecting".
+        result = self.run_with([summary_only_availability(direct=None)], direct_only=True)
+        self.assertEqual([(o.detail_level, o.stops) for o in result.options], [("summary", -1)])
+        self.assertEqual(sa.format_stops(result.options[0].stops), "?")
+        self.assertTrue(any("no nonstop flag" in n for n in result.notes))
+
+    def test_nonstop_search_quotes_the_nonstop_price_seats_and_airlines(self):
+        record = summary_only_availability(
+            direct=True,
+            JDirectMileageCost="82000", JDirectRemainingSeats=4, JDirectAirlines="SQ",
+        )
+        result = self.run_with([record], direct_only=True)
+        row = result.options[0]
+        self.assertEqual((row.mileage_cost, row.remaining_seats, row.airlines), (82000, 4, ["SQ"]))
+
+    def test_without_the_flag_the_cabin_wide_figures_are_kept(self):
+        record = summary_only_availability(
+            direct=True,
+            JDirectMileageCost="82000", JDirectRemainingSeats=4, JDirectAirlines="SQ",
+        )
+        result = self.run_with([record])
+        row = result.options[0]
+        self.assertEqual((row.mileage_cost, row.remaining_seats, row.airlines), (60000, 2, ["SQ", "LH"]))
+
+    def test_party_size_is_judged_on_the_nonstop_seat_count(self):
+        # The cabin as a whole has one seat, but its nonstop space has four.
+        record = summary_only_availability(direct=True, JRemainingSeats=1, JDirectRemainingSeats=4)
+        self.assertEqual(len(self.run_with([record], direct_only=True, pax=2).options), 1)
+        self.assertEqual(self.run_with([record], pax=2).options, [])
+
+    def test_the_nonstop_filter_is_explained_in_the_notes(self):
+        result = self.run_with([summary_only_availability(direct=True)], direct_only=True)
+        self.assertTrue(any("Filtered to nonstop itineraries" in n for n in result.notes))
 
 
 # --------------------------------------------------------------------------- FlightPoints output captured live
@@ -1273,7 +1315,6 @@ class BatchMatrixTests(unittest.TestCase):
     """
 
     def test_small_matrix_passes_every_invariant(self):
-        sys.path.insert(0, str(ROOT / "tests"))
         import batch_matrix
 
         with tempfile.TemporaryDirectory() as tmp:

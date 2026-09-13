@@ -60,8 +60,9 @@ seats.aero row, regardless of program. A flight match outranks a program match i
 - `get-flight-details` labels premium economy `Prem. Eco.`, which is out of scope and is skipped.
 - A programme can appear in the results table but not in the "Premium cabins" block, so the two
   sections disagree on how many programmes were seen; only the block is parsed.
-- FlightPoints covers programmes seats.aero does not track (`LifeMiles`, `Miles&Go`). Those labels stay
-  verbatim, never match, and are reported as options seats.aero did not have.
+- FlightPoints covers programmes seats.aero does not track. A label such as `Miles&Go` that reaches the
+  "Premium cabins" block stays verbatim, never matches, and is reported as an option seats.aero did not
+  have; one that only ever appears in the results table (`LifeMiles` in the captures) is never parsed at all.
 
 ## Program identifiers
 
