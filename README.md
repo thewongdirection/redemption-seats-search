@@ -96,6 +96,26 @@ The script refuses to take the key as a command-line argument, never prints it, 
 readable by other users. `.gitignore` excludes `.env`, `*.key` and `api_key` files, and
 `scripts/check_secrets.sh` scans tracked files for key-shaped strings (it runs in CI too).
 
+## Before each search
+
+```bash
+python3 scripts/preflight.py
+```
+
+Updates this skill to the newest version its git remote offers (clean checkouts only, fast-forward
+only), clears reports and cross-check files left over from earlier searches, and proves the key still
+works with one live call to seats.aero. Exit 0 ready, 2 fix something (no key, python too old), 3
+seats.aero refused or unreachable.
+
+| Option | Effect |
+|---|---|
+| `--flush-all` | Clear every report and cross-check file, whatever its age |
+| `--max-age-hours N` | How old a report may be before it is cleared. Default 12 |
+| `--crosscheck-max-age-minutes N` | Same for cross-check dumps. Default 60 |
+| `--offline` | Skip the remote fetch and the live API call |
+| `--no-update` / `--no-flush` | Leave the checkout or the old files alone (debugging) |
+| `--json` | Machine-readable report |
+
 ## Use it
 
 In Claude Code, just ask:
@@ -189,7 +209,7 @@ drive a seats.aero MCP server.
 ## Development
 
 ```bash
-./run_tests.sh              # 120 offline unit tests, network mocked
+./run_tests.sh              # 175 offline unit tests, network mocked
 ./scripts/check_secrets.sh  # credential scan
 ```
 
@@ -219,6 +239,7 @@ references/flightpoints.md   observed FlightPoints tool formats and match rules
 SETUP.md                     step-by-step onboarding for a new user
 CLAUDE.md                    points Claude at SKILL.md in web sessions on this repo
 scripts/search_awards.py     the search tool (seats.aero)
+scripts/preflight.py         update, flush and prerequisite checks run before each search
 scripts/check_secrets.sh     credential scanner
 references/                  API notes and MCP alternative
 tests/                       regression suite, API fixtures, batch matrix harness

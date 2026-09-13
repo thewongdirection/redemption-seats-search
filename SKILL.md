@@ -11,6 +11,54 @@ Answer one question well: **for this route, date and party size, which premium-c
 The bundled script does the API work. Your job is to collect four inputs, run it, and present the
 result so the user can act on it.
 
+## 0. Preflight, before every search
+
+Run this first, every time. It is not optional and it is not a one-off setup step:
+
+```bash
+python3 scripts/preflight.py
+```
+
+It does three things a search must never skip:
+
+1. **Updates the skill.** It fetches the repository this copy was installed from and fast-forwards to
+   the newest version, so a search never runs on stale code. It moves only this skill's own clean
+   checkout, with no local commits, along the branch it already tracks; a copy vendored inside someone
+   else's repository, a dirty tree, local commits, a missing git or an unreachable remote are all
+   reported and left alone. If it says `updated`, the search you run next is already the new version -
+   no restart needed.
+2. **Flushes stale data.** Reports, saved `--json` runs and cross-check dumps from earlier searches are
+   deleted (reports older than 12h, cross-check files older than 1h). Award space moves hourly: an old
+   report is not evidence about now, and an old cross-check file describes another search. Use
+   `--flush-all` when the user is starting a fresh session of searching.
+3. **Proves the search can work.** python version, an API key, and one live call to seats.aero that
+   confirms the key is still accepted and the network is there - one call of the ~1,000/day quota,
+   spent before the user waits on a real search.
+
+Read its exit code and act:
+
+| Exit | Meaning | What to do |
+|---|---|---|
+| 0 | ready | Search. Pass on any `warning` line that affects the answer (for example, a checkout that could not be updated). |
+| 2 | the user must fix something | No key, or python too old. Walk them through the matching row of the troubleshooting table in `SETUP.md`. Do not search. |
+| 3 | seats.aero refused or could not be reached | An expired key or membership, or no network. Say which, and do not spend quota trying searches that cannot work. |
+
+A `warning` on the `seats.aero` line means the key is fine but the API is busy: HTTP 429 is this
+account's rate limit or a spent daily quota, a 5xx is seats.aero having trouble. The search may still
+work, so run it, but tell the user what the preflight saw if the search then comes back thin or fails.
+
+Two checks the script cannot make, so make them yourself before searching:
+
+- **Connectors.** The script cannot see MCP tools. Check whether the FlightPoints tools (`search-flights`,
+  `get-flight-details`) are present in this session. If they are, plan the cross-check in step 2b; if they
+  are not, search seats.aero alone and say in your reply that the rows are unconfirmed by a second source.
+- **Freshness.** Run the search *without* `--no-refresh` so seats.aero re-scrapes the matching records
+  first. Reach for cached data only when the user asks for it or the quota is nearly spent, and when you
+  do, say so in the reply next to the numbers.
+
+`--offline` skips the fetch and the live call when there is genuinely no network; `--no-update` and
+`--no-flush` exist for debugging and should not be used in a normal search.
+
 ## 1. Collect the inputs
 
 | Input | Required | Notes |
@@ -22,15 +70,16 @@ result so the user can act on it.
 | Flexibility | optional | `--flex N` searches ±N days (max 7). Offer it when a date returns nothing. For a whole month or any span up to 62 days use `--date FIRST --end-date LAST` instead. |
 | Cabin | optional | Default is business **and** first. Use `--cabins first` when the user only wants first. Economy and premium economy are out of scope; the script refuses them. |
 | Nonstop only | optional | `--direct-only`. |
-| Fresh data | default on | Every search first asks seats.aero to re-scrape the matching business/first records (oldest first, up to 100) and waits up to 120s, so the report reflects what the programs show now. Each refreshed record spends one call of the 1,000/day quota: a single date costs 5–30 calls, a month-long range 60–150. Before running a range longer than two weeks, tell the user the rough cost and that it takes a few minutes; if they are exploring several ranges in one day, suggest `--no-refresh` for all but the one they will book from. `--refresh-older-than HOURS` narrows the refresh to older records. |
+| Fresh data | default on, keep it on | Every search first asks seats.aero to re-scrape the matching business/first records (oldest first, up to 100) and waits up to 120s, so the report reflects what the programs show now. Each refreshed record spends one call of the 1,000/day quota: a single date costs 5–30 calls, a month-long range 60–150. Before running a range longer than two weeks, tell the user the rough cost and that it takes a few minutes; if they are exploring several ranges in one day, suggest `--no-refresh` for all but the one they will book from. `--refresh-older-than HOURS` narrows the refresh to older records. |
 
 If origin, destination or party size is missing, ask for it in one short message rather than guessing. A missing
 date is not a blocker: run without `--date` and explain the schedule-opening scan.
 
 Prerequisites the user must already have: a seats.aero Pro membership, a Partner API key in
-`SEATS_AERO_API_KEY` or `~/.config/seats-aero/api_key`, python3, and network access to `seats.aero`. If the
-script exits with code 2 or 3, walk the user through the matching row of the troubleshooting table in
-`SETUP.md` rather than improvising; that file is the complete onboarding guide for a new person.
+`SEATS_AERO_API_KEY` or `~/.config/seats-aero/api_key`, python3, and network access to `seats.aero`.
+Step 0 checks all of these for you. If either script exits with code 2 or 3, walk the user through the
+matching row of the troubleshooting table in `SETUP.md` rather than improvising; that file is the
+complete onboarding guide for a new person.
 
 ## 2. Run the search
 

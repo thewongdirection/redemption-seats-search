@@ -81,6 +81,19 @@ chmod 600 ~/.config/seats-aero/api_key
 
 ### A3. Check that everything works
 
+Run the preflight first - it checks the key, the network and your python in one go, and tells you
+exactly which of them is wrong if something is:
+
+```bash
+cd ~/travel            # or wherever you want reports written
+python3 ~/.claude/skills/redemption-seats-search/scripts/preflight.py
+```
+
+It also updates the skill to the newest version and clears stale reports, which is what it does before
+every search from then on. Run it from the directory you run searches in: reports are written to
+`award-reports/` beneath the current directory, and that is the one it clears (the line it prints names
+the directory, so a run from the wrong place is obvious).
+
 ```bash
 cd ~/redemption-seats-search
 ./run_tests.sh                                                  # offline; should end with "OK"

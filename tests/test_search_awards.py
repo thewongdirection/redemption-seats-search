@@ -5,11 +5,13 @@ run offline and never need a real API key.
 """
 from __future__ import annotations
 
+import contextlib
 import io
 import json
 import os
 import shutil
 import subprocess
+import time
 import sys
 import tempfile
 import unittest
@@ -23,6 +25,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "scripts"))
 sys.path.insert(0, str(ROOT / "tests"))
 
+import preflight as pf  # noqa: E402
 import search_awards as sa  # noqa: E402
 
 FIXTURES = ROOT / "tests" / "fixtures"
@@ -1549,6 +1552,350 @@ class SortScriptBehaviourTests(unittest.TestCase):
     @unittest.skipUnless(shutil.which("node"), "node is not installed")
     def test_unknown_values_still_sort_last(self):
         self.assertEqual(self.order_after_sorting(["500", "", "100"]), [2, 0, 1])
+
+
+# --------------------------------------------------------------------------- preflight
+
+
+def git(args: list[str], root: Path) -> subprocess.CompletedProcess:
+    env = {**os.environ, "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@e", "GIT_COMMITTER_NAME": "t",
+           "GIT_COMMITTER_EMAIL": "t@e", "GIT_CONFIG_GLOBAL": "/dev/null", "GIT_CONFIG_SYSTEM": "/dev/null"}
+    return subprocess.run(["git", "-C", str(root), *args], capture_output=True, text=True, env=env, check=False)
+
+
+def make_checkout(tmp: Path) -> tuple[Path, Path]:
+    """An origin repository with one commit, and a clone of it that tracks its branch."""
+    origin, clone = tmp / "origin", tmp / "clone"
+    origin.mkdir()
+    git(["init", "--quiet", "-b", "main", "."], origin)
+    (origin / "SKILL.md").write_text("v1\n")
+    git(["add", "-A"], origin)
+    git(["commit", "--quiet", "-m", "first"], origin)
+    subprocess.run(["git", "clone", "--quiet", str(origin), str(clone)], check=True, capture_output=True)
+    return origin, clone
+
+
+def publish(origin: Path, text: str) -> None:
+    (origin / "SKILL.md").write_text(text)
+    git(["add", "-A"], origin)
+    git(["commit", "--quiet", "-m", "newer"], origin)
+
+
+@unittest.skipUnless(shutil.which("git"), "git is not installed")
+class PreflightUpdateTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+        self.origin, self.clone = make_checkout(self.tmp)
+
+    def run_update(self, root: Path | None = None) -> pf.Report:
+        report = pf.Report()
+        pf.update_skill(root or self.clone, report)
+        return report
+
+    def step(self, report: pf.Report) -> dict:
+        return next(s for s in report.steps if s["step"] == "update")
+
+    def test_a_newer_version_is_pulled_in(self):
+        publish(self.origin, "v2\n")
+        step = self.step(self.run_update())
+        self.assertEqual(step["status"], "updated")
+        self.assertEqual(step["commits"], 1)
+        self.assertEqual((self.clone / "SKILL.md").read_text(), "v2\n")
+
+    def test_an_up_to_date_checkout_is_left_alone(self):
+        self.assertEqual(self.step(self.run_update())["status"], "ok")
+        self.assertEqual((self.clone / "SKILL.md").read_text(), "v1\n")
+
+    def test_uncommitted_work_is_never_overwritten(self):
+        publish(self.origin, "v2\n")
+        (self.clone / "SKILL.md").write_text("mine\n")
+        step = self.step(self.run_update())
+        self.assertEqual(step["status"], "warning")
+        self.assertIn("uncommitted changes", step["detail"])
+        self.assertEqual((self.clone / "SKILL.md").read_text(), "mine\n")
+
+    def test_local_commits_are_never_discarded(self):
+        publish(self.origin, "v2\n")
+        (self.clone / "local.md").write_text("local work\n")
+        git(["add", "-A"], self.clone)
+        git(["commit", "--quiet", "-m", "local"], self.clone)
+        head = git(["rev-parse", "HEAD"], self.clone).stdout
+        step = self.step(self.run_update())
+        self.assertEqual(step["status"], "warning")
+        self.assertIn("its own", step["detail"])
+        self.assertEqual(git(["rev-parse", "HEAD"], self.clone).stdout, head)
+
+    def test_an_unreachable_remote_is_a_warning_not_a_failure(self):
+        publish(self.origin, "v2\n")
+        git(["remote", "set-url", "origin", str(self.tmp / "gone")], self.clone)
+        report = self.run_update()
+        self.assertEqual(self.step(report)["status"], "warning")
+        self.assertEqual(report.exit_code, 0, "a failed update must never stop a search")
+
+    def test_a_plain_directory_is_not_treated_as_a_checkout(self):
+        plain = self.tmp / "plain"
+        plain.mkdir()
+        self.assertEqual(self.step(self.run_update(plain))["status"], "skipped")
+
+    def test_offline_does_not_touch_the_network(self):
+        publish(self.origin, "v2\n")
+        report = pf.Report()
+        pf.update_skill(self.clone, report, offline=True)
+        self.assertEqual(self.step(report)["status"], "skipped")
+        self.assertEqual((self.clone / "SKILL.md").read_text(), "v1\n")
+
+
+class PreflightFlushTests(unittest.TestCase):
+    def setUp(self):
+        self.dir = Path(tempfile.mkdtemp()) / "award-reports"
+        (self.dir / "crosscheck").mkdir(parents=True)
+
+    def write(self, name: str, age_hours: float) -> Path:
+        path = self.dir / name
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("x" * 100)
+        stamp = time.time() - age_hours * 3600
+        os.utime(path, (stamp, stamp))
+        return path
+
+    def flush(self, **kw) -> pf.Report:
+        report = pf.Report()
+        pf.flush_stale_data(self.dir, report, kw.get("max_age_hours", pf.DEFAULT_MAX_AGE_HOURS),
+                            kw.get("crosscheck_max_age_minutes", pf.DEFAULT_CROSSCHECK_MAX_AGE_MINUTES),
+                            kw.get("flush_all", False))
+        return report
+
+    def test_stale_reports_and_runs_go_and_fresh_ones_stay(self):
+        old_html, old_json = self.write("awards_SIN-LHR_2026-11-14_pax2.html", 30), self.write("run.json", 30)
+        fresh = self.write("awards_SIN-HND_2026-12-01_pax2.html", 1)
+        self.flush()
+        self.assertFalse(old_html.exists())
+        self.assertFalse(old_json.exists())
+        self.assertTrue(fresh.exists(), "a report from an hour ago is still this session's work")
+
+    def test_cross_check_dumps_expire_within_the_hour(self):
+        stale = self.write("crosscheck/search-SIN-HND.txt", 2)
+        fresh = self.write("crosscheck/search-JFK-AMS.txt", 0.2)
+        self.flush()
+        self.assertFalse(stale.exists(), "an old cross-check file describes another search")
+        self.assertTrue(fresh.exists())
+
+    def test_flush_all_clears_everything_whatever_its_age(self):
+        paths = [self.write("awards_a_2026-11-14_pax2.html", 0.1), self.write("crosscheck/x.txt", 0.1)]
+        self.flush(flush_all=True)
+        self.assertEqual([p for p in paths if p.exists()], [])
+
+    def test_nothing_outside_the_report_directory_is_touched(self):
+        outside = self.dir.parent / "awards_keepme.html"
+        outside.write_text("not ours")
+        os.utime(outside, (0, 0))
+        nested = self.dir / "archive"
+        nested.mkdir()
+        buried = self.write("archive/awards_old.html", 99)
+        self.flush()
+        self.assertTrue(outside.exists(), "only the report directory is ever cleared")
+        self.assertTrue(buried.exists(), "flush does not recurse into other directories")
+
+    def test_a_missing_report_directory_is_fine(self):
+        report = pf.Report()
+        pf.flush_stale_data(self.dir.parent / "never-made", report, 12, 60)
+        self.assertEqual(report.steps[0]["status"], "ok")
+        self.assertEqual(report.exit_code, 0)
+
+    def test_the_summary_counts_what_it_removed(self):
+        for n in range(3):
+            self.write(f"awards_r{n}_2026-11-14_pax2.html", 40)
+        report = self.flush()
+        self.assertEqual(report.steps[0]["removed"], 3)
+        self.assertIn("cleared 3 stale file(s)", report.steps[0]["detail"])
+
+
+class PreflightCheckTests(unittest.TestCase):
+    def client_factory(self, opener: FakeOpener, **client_kw):
+        """Hand preflight a client wired to a fake opener, without the patched name recursing."""
+        real = sa.SeatsAeroClient
+        return lambda key, **kw: real(key, opener=opener, sleep=lambda _seconds: None, **client_kw)
+
+    def key_file(self, value: str = "test-key") -> Path:
+        path = Path(tempfile.mkdtemp()) / "api_key"
+        path.write_text(value)
+        path.chmod(0o600)
+        return path
+
+    def test_a_missing_key_blocks_the_search_with_exit_2(self):
+        report = pf.Report()
+        with mock.patch.dict(os.environ, {"SEATS_AERO_API_KEY": "", "SEATS_API_KEY": ""}, clear=False), \
+             mock.patch.object(sa, "API_KEY_FILE", Path("/nonexistent/api_key")):
+            pf.check_api_key(report)
+        self.assertEqual(report.exit_code, 2)
+        self.assertIn("No seats.aero API key", report.blocked)
+
+    def test_a_key_the_api_rejects_blocks_the_search_with_exit_3(self):
+        report = pf.Report()
+        opener = FakeOpener({"search": http_error("https://seats.aero/partnerapi/search", 403, "forbidden")})
+        with mock.patch.object(sa, "SeatsAeroClient", self.client_factory(opener)):
+            pf.check_seats_aero("stale-key", report)
+        self.assertEqual(report.exit_code, 3)
+        self.assertIn("rejected the API key", report.blocked)
+
+    def test_an_unreachable_api_blocks_the_search_with_exit_3(self):
+        report = pf.Report()
+        opener = FakeOpener({"search": urllib.error.URLError("no route to host")})
+        with mock.patch.object(sa, "SeatsAeroClient", self.client_factory(opener, max_retries=0)):
+            pf.check_seats_aero("test-key", report)
+        self.assertEqual(report.exit_code, 3)
+        self.assertIn("could not reach seats.aero", report.blocked)
+
+    def test_a_working_key_costs_exactly_one_call(self):
+        report = pf.Report()
+        opener = FakeOpener({"search": {"data": [], "hasMore": False, "cursor": 0}})
+        build, clients = self.client_factory(opener), []
+        def factory(key, **kw):
+            clients.append(build(key, **kw))
+            return clients[-1]
+        with mock.patch.object(sa, "SeatsAeroClient", factory):
+            pf.check_seats_aero("test-key", report)
+        self.assertEqual(report.exit_code, 0)
+        self.assertEqual(clients[0].calls_made, 1)
+        self.assertEqual(len(opener.requests), 1)
+        self.assertIn("take=1", opener.requests[0])
+
+    def test_python_older_than_the_floor_is_refused(self):
+        report = pf.Report()
+        with mock.patch.object(sys, "version_info", (3, 8, 0, "final", 0)):
+            pf.check_python(report)
+        self.assertEqual(report.exit_code, 2)
+        self.assertIn("too old", report.blocked)
+
+    def test_connector_and_freshness_reminders_are_always_present(self):
+        report = pf.Report()
+        pf.note_connectors(report)
+        pf.note_freshness(report)
+        details = " ".join(s["detail"] for s in report.steps)
+        self.assertIn("FlightPoints", details)
+        self.assertIn("--no-refresh", details)
+
+
+class PreflightCommandTests(unittest.TestCase):
+    def test_offline_run_reports_ready_without_touching_the_network(self):
+        out = io.StringIO()
+        key = Path(tempfile.mkdtemp()) / "api_key"
+        key.write_text("test-key")
+        key.chmod(0o600)
+        with mock.patch.object(sa, "API_KEY_FILE", key), mock.patch.dict(os.environ, {"SEATS_AERO_API_KEY": ""}, clear=False), \
+             contextlib.redirect_stdout(out):
+            code = pf.main(["--offline", "--no-flush", "--json"])
+        payload = json.loads(out.getvalue())
+        self.assertEqual(code, 0)
+        self.assertTrue(payload["ready"])
+        self.assertEqual({s["step"] for s in payload["steps"]},
+                         {"update", "flush", "python", "api key", "seats.aero", "connectors", "freshness"})
+
+    def test_a_blocked_run_says_so_and_exits_nonzero(self):
+        out = io.StringIO()
+        with mock.patch.dict(os.environ, {"SEATS_AERO_API_KEY": "", "SEATS_API_KEY": ""}, clear=False), \
+             mock.patch.object(sa, "API_KEY_FILE", Path("/nonexistent/api_key")), contextlib.redirect_stdout(out):
+            code = pf.main(["--offline", "--no-flush"])
+        self.assertEqual(code, 2)
+        self.assertIn("cannot search:", out.getvalue())
+
+
+class PreflightSafetyTests(unittest.TestCase):
+    """The review found these six; each one stays fixed."""
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+
+    @unittest.skipUnless(shutil.which("git"), "git is not installed")
+    def test_a_skill_vendored_in_another_repo_never_updates_that_repo(self):
+        project = self.tmp / "project"
+        (project / ".claude" / "skills" / "rss").mkdir(parents=True)
+        git(["init", "--quiet", "-b", "main", "."], project)
+        (project / "app.py").write_text("the user's own code\n")
+        git(["add", "-A"], project)
+        git(["commit", "--quiet", "-m", "project"], project)
+        head = git(["rev-parse", "HEAD"], project).stdout
+
+        report = pf.Report()
+        pf.update_skill(project / ".claude" / "skills" / "rss", report)
+        step = next(s for s in report.steps if s["step"] == "update")
+        self.assertEqual(step["status"], "skipped")
+        self.assertIn("not its own", step["detail"])
+        self.assertEqual(git(["rev-parse", "HEAD"], project).stdout, head, "the host repository must not move")
+        self.assertEqual((project / "app.py").read_text(), "the user's own code\n")
+
+    def test_a_machine_without_git_reports_a_skipped_update_not_a_traceback(self):
+        report = pf.Report()
+        with mock.patch.object(pf.subprocess, "run", side_effect=FileNotFoundError("git")):
+            pf.update_skill(self.tmp, report)
+        step = next(s for s in report.steps if s["step"] == "update")
+        self.assertEqual(step["status"], "skipped")
+        self.assertIn("git is not installed", step["detail"])
+        self.assertEqual(report.exit_code, 0)
+
+    def test_rate_limiting_is_a_warning_because_the_key_is_still_good(self):
+        report = pf.Report()
+        opener = FakeOpener({"search": http_error("https://seats.aero/partnerapi/search", 429, "slow down", {"Retry-After": "3600"})})
+        real = sa.SeatsAeroClient
+        sleeps = []
+        with mock.patch.object(sa, "SeatsAeroClient", lambda key, **kw: real(key, opener=opener, sleep=sleeps.append, **kw)):
+            pf.check_seats_aero("test-key", report)
+        step = next(s for s in report.steps if s["step"] == "seats.aero")
+        self.assertEqual(step["status"], "warning")
+        self.assertEqual(report.exit_code, 0, "a busy API is not an invalid key")
+        self.assertEqual(sleeps, [], "the preflight must not wait out a Retry-After of an hour")
+        self.assertEqual(len(opener.requests), 1)
+
+    def test_a_server_error_is_a_warning_too(self):
+        report = pf.Report()
+        opener = FakeOpener({"search": http_error("https://seats.aero/partnerapi/search", 503, "maintenance")})
+        real = sa.SeatsAeroClient
+        with mock.patch.object(sa, "SeatsAeroClient", lambda key, **kw: real(key, opener=opener, sleep=lambda _s: None, **kw)):
+            pf.check_seats_aero("test-key", report)
+        self.assertEqual(next(s for s in report.steps if s["step"] == "seats.aero")["status"], "warning")
+        self.assertEqual(report.exit_code, 0)
+
+    def test_an_unreadable_response_blocks_rather_than_crashing(self):
+        report = pf.Report()
+        class Garbage(FakeResponse):
+            def read(self):
+                return b"<html>not json</html>"
+        real = sa.SeatsAeroClient
+        with mock.patch.object(sa, "SeatsAeroClient",
+                               lambda key, **kw: real(key, opener=lambda req, timeout: Garbage(b""), sleep=lambda _s: None, **kw)):
+            pf.check_seats_aero("test-key", report)
+        self.assertEqual(report.exit_code, 3)
+        self.assertIn("could not read", report.blocked)
+
+    def test_only_the_files_this_skill_writes_are_deleted(self):
+        reports = self.tmp / "award-reports"
+        reports.mkdir()
+        keep = reports / "my-notes.json"           # someone else's file parked in the same folder
+        keep.write_text("{}")
+        os.utime(keep, (0, 0))
+        ours = reports / "awards_SIN-LHR_2026-11-14_pax2.html"
+        ours.write_text("<html></html>")
+        os.utime(ours, (0, 0))
+        run_dump = reports / "run.json"
+        run_dump.write_text("{}")
+        os.utime(run_dump, (0, 0))
+
+        report = pf.Report()
+        pf.flush_stale_data(reports, report, 12, 60, flush_all=True)
+        self.assertTrue(keep.exists(), "an unrelated JSON file is not this skill's to delete")
+        self.assertFalse(ours.exists())
+        self.assertFalse(run_dump.exists())
+
+    def test_the_flush_line_names_the_directory_it_cleared(self):
+        reports = self.tmp / "award-reports"
+        reports.mkdir()
+        stale = reports / "awards_a_2026-11-14_pax2.html"
+        stale.write_text("x")
+        os.utime(stale, (0, 0))
+        report = pf.Report()
+        pf.flush_stale_data(reports, report, 12, 60)
+        self.assertEqual(report.steps[0]["directory"], str(reports.resolve()))
+        self.assertIn(str(reports.resolve()), report.steps[0]["detail"])
 
 
 if __name__ == "__main__":
