@@ -8,6 +8,8 @@ from __future__ import annotations
 import io
 import json
 import os
+import shutil
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -45,10 +47,13 @@ class FakeOpener:
     def __init__(self, routes: dict[str, object]):
         self.routes = routes
         self.requests: list[str] = []
+        self.bodies: list[str] = []
 
     def __call__(self, request, timeout):
         url = request.full_url
         self.requests.append(url)
+        if request.data:
+            self.bodies.append(request.data.decode("utf-8"))
         assert request.get_header("Partner-authorization"), "API key header missing"
         path = url.split("/partnerapi/", 1)[1].split("?", 1)[0]
         handler = self.routes.get(path)
@@ -245,7 +250,7 @@ class RefreshTests(unittest.TestCase):
         self.assertEqual(outcome.succeeded, 2)
         self.assertFalse(outcome.timed_out)
         self.assertEqual(sleeps, [5, 5])
-        self.assertEqual(client.calls_made, 1, "polls are free and must not inflate the call count")
+        self.assertEqual(client.calls_made, 2, "one quota call per record refreshed; polls are free")
         self.assertEqual(outcome.quota["remaining"], 850)
         self.assertIn("2 refreshed", outcome.summary())
         self.assertIn("850/1000", outcome.summary())
@@ -579,8 +584,8 @@ class RenderingTests(unittest.TestCase):
         self.assertIn("| Flights | Date | Route | Dep → Arr |", text)
         self.assertIn("| 2026-11-14 | SIN-LHR |", text)
         html = sa.render_html(result)
-        self.assertIn(">Date</th>", html)
-        self.assertIn(">Route</th>", html)
+        self.assertIn(">Date</button></th>", html)
+        self.assertIn(">Route</button></th>", html)
 
     def test_markdown_overnight_arrival_marker(self):
         text = sa.render_markdown(self.result)
@@ -854,7 +859,7 @@ class CrossCheckRenderingTests(unittest.TestCase):
         self.assertEqual(loaded.crosscheck.program_matches, result.crosscheck.program_matches)
         html = sa.render_html(loaded)
         self.assertIn("✓ 2 sources", html)
-        self.assertIn(">Sources</th>", html)          # the badge and green rows are explained
+        self.assertIn(">Sources</button></th>", html)   # the badge and green rows are explained
         self.assertIn("Confirmed by FlightPoints", html)
 
     def test_load_without_a_summary_still_explains_confirmed_rows(self):
@@ -867,7 +872,7 @@ class CrossCheckRenderingTests(unittest.TestCase):
         path.write_text(json.dumps(payload))
         loaded = sa.load_result(path)
         self.assertIsNotNone(loaded.crosscheck)
-        self.assertIn(">Sources</th>", sa.render_html(loaded))
+        self.assertIn(">Sources</button></th>", sa.render_html(loaded))
 
     def test_unreadable_cross_check_files_add_a_note_not_a_crash(self):
         client, _, _ = make_client(default_routes())
@@ -941,7 +946,11 @@ class SortableDashboardTests(unittest.TestCase):
         self.assertEqual(sortable, [c.header for c in self.columns if c.header != "Book"])
         for index, column in enumerate(self.columns):
             if column.sort is not None:
-                self.assertIn(f'data-col="{index}" tabindex="0" role="button" aria-sort="none"', self.html)
+                # aria-sort only means something on a columnheader, so the th keeps that role
+                # and the control is a button inside it.
+                self.assertIn(f'data-col="{index}" aria-sort="none"', self.html)
+                self.assertIn(f'<button type="button" title="Sort by {column.header}">{column.header}</button>', self.html)
+        self.assertNotIn('role="button"', self.html)
         self.assertEqual(self.html.count('aria-sort="none"'), len(sortable))
         self.assertNotIn('title="Sort by Book"', self.html)
 
@@ -982,7 +991,10 @@ class SortableDashboardTests(unittest.TestCase):
         self.assertIn("getElementById('awards')", self.html)
         self.assertIn("Click a column heading to sort", self.html)
         self.assertNotIn("<script src", self.html)     # self-contained: no external dependency
-        self.assertIn("e.key === 'Enter'", self.html)  # keyboard accessible
+        # Keyboard support now comes from the native <button> in each sortable header,
+        # so the script no longer needs its own Enter/Space handling.
+        self.assertIn('<button type="button" title="Sort by Program">', self.html)
+        self.assertNotIn("e.key === 'Enter'", self.html)
 
     def test_default_order_hint_mentions_cross_check_only_when_present(self):
         self.assertIn("the cheapest first", self.html)
@@ -1004,7 +1016,7 @@ class HtmlReportTests(unittest.TestCase):
         self.assertTrue(self.html.startswith("<!doctype html>"))
         self.assertIn("color-scheme:dark", self.html)
         self.assertIn("<title>Award seats SIN → LHR · 2026-11-14</title>", self.html)
-        self.assertIn(">Book</th>", self.html)
+        self.assertIn(">Book</th>", self.html)          # not sortable, so no button
         self.assertNotIn("position:sticky;right:0", self.html)   # table is narrow enough not to need a pinned column
 
     def test_rows_link_to_program_booking_page_and_airline_site(self):
@@ -1323,6 +1335,220 @@ class BatchMatrixTests(unittest.TestCase):
         self.assertEqual(failures, [])
         self.assertEqual(coverage["scenarios"], 4)
         self.assertGreater(coverage["options"], 0)
+
+
+# --------------------------------------------------------------------------- review follow-ups
+
+
+class UnknownFieldTests(unittest.TestCase):
+    """seats.aero omits fields on some records; absent must never be read as a convenient default."""
+
+    def trip(self, **overrides) -> dict:
+        base = {
+            "ID": "trip-x", "Cabin": "business", "MileageCost": 60000, "TotalTaxes": 1000,
+            "TaxesCurrency": "USD", "RemainingSeats": 2, "Carriers": "LH, LH",
+            "FlightNumbers": "LH405, LH996", "DepartsAt": "2026-11-14T10:00:00Z",
+            "ArrivesAt": "2026-11-14T18:00:00Z", "TotalDuration": 480,
+            "AvailabilitySegments": [{"Order": 0}, {"Order": 1}],
+        }
+        base.update(overrides)
+        return base
+
+    def availability(self) -> dict:
+        return {"ID": "avail-1", "Date": "2026-11-14", "Source": "aeroplan", "JAvailable": True,
+                "Route": {"OriginAirport": "SIN", "DestinationAirport": "LHR"}, "UpdatedAt": "2026-11-13T00:00:00Z"}
+
+    def test_a_trip_without_a_stops_field_is_unknown_not_nonstop(self):
+        options = sa._trip_options(self.availability(), {"data": [self.trip()]}, query())
+        self.assertEqual([o.stops for o in options], [1])            # two segments means one stop
+        self.assertEqual(sa.format_stops(options[0].stops), "1 stop")
+
+    def test_a_trip_with_neither_stops_nor_segments_reports_an_unknown_stop_count(self):
+        trip = self.trip(AvailabilitySegments=[], FlightNumbers="")
+        options = sa._trip_options(self.availability(), {"data": [trip]}, query())
+        self.assertEqual([o.stops for o in options], [-1])
+        self.assertEqual(sa.format_stops(options[0].stops), "?")
+
+    def test_a_connecting_trip_without_a_stops_field_is_dropped_by_direct_only(self):
+        options = sa._trip_options(self.availability(), {"data": [self.trip()]}, query(direct_only=True))
+        self.assertEqual(options, [])
+
+    def test_a_nonstop_trip_without_a_stops_field_survives_direct_only(self):
+        trip = self.trip(AvailabilitySegments=[{"Order": 0}], FlightNumbers="SQ308", Carriers="SQ")
+        options = sa._trip_options(self.availability(), {"data": [trip]}, query(direct_only=True))
+        self.assertEqual([o.stops for o in options], [0])
+
+    def test_an_unreadable_timestamp_is_infinitely_old_not_brand_new(self):
+        self.assertEqual(sa._hours_since(""), float("inf"))
+        self.assertEqual(sa._hours_since("not a date"), float("inf"))
+        self.assertEqual(sa.format_age("not a date"), "unknown")
+
+    def test_records_of_unknown_age_are_the_first_ones_refreshed(self):
+        records = [
+            dict(self.availability(), ID="fresh", UpdatedAt=sa._iso_now() if hasattr(sa, "_iso_now") else "2026-11-13T00:00:00Z"),
+            dict(self.availability(), ID="ageless", UpdatedAt=""),
+        ]
+        routes = {"search": {"data": records, "hasMore": False, "cursor": 0},
+                  "refresh": lambda: refresh_response({"ageless": "succeeded", "fresh": "succeeded"}, complete=True),
+                  "trips/fresh": {"data": []}, "trips/ageless": {"data": []}}
+        client, opener, _ = make_client(routes)
+        sa.run_search(client, query(refresh=True, refresh_older_than_hours=1.0))
+        posted = json.loads([r for r in opener.bodies if "availability_ids" in r][0])["availability_ids"]
+        self.assertEqual(posted[0], "ageless", "a record with no usable timestamp must be refreshed first")
+
+    def test_a_record_without_an_id_cannot_be_refreshed_and_does_not_crash(self):
+        records = [{k: v for k, v in self.availability().items() if k != "ID"}]
+        routes = {"search": {"data": records, "hasMore": False, "cursor": 0}}
+        client, opener, _ = make_client(routes)
+        result = sa.run_search(client, query(refresh=True))
+        self.assertFalse(any("refresh" in url for url in opener.requests))
+        self.assertEqual(result.premium_matches, 1)
+
+    def test_a_published_zero_seat_count_on_nonstop_space_is_not_overwritten(self):
+        record = summary_only_availability(direct=True, JRemainingSeats=4, JDirectRemainingSeats=0)
+        client, _, _ = make_client({"search": {"data": [record], "hasMore": False, "cursor": 0}})
+        result = sa.run_search(client, query(max_trip_lookups=0, direct_only=True, pax=4))
+        self.assertEqual([o.remaining_seats for o in result.options], [0])   # "not published", not four
+        self.assertTrue(any("does not publish a seat count" in n for n in result.notes))
+
+
+class QuotaAccountingTests(unittest.TestCase):
+    def test_a_refresh_costs_one_call_per_record(self):
+        client, _, _ = make_client({"refresh": lambda: refresh_response({"a": "succeeded", "b": "succeeded", "c": "succeeded"}, complete=True)})
+        client.refresh_and_wait(["a", "b", "c"])
+        self.assertEqual(client.calls_made, 3)
+
+    def test_the_report_footer_shows_the_quota_seats_aero_reported(self):
+        result = sa.SearchResult(query=query(), options=[], notes=[], api_calls=4, availabilities_seen=0,
+                                 generated_at="2026-09-13T00:00:00+00:00",
+                                 refresh=sa.RefreshOutcome(requested=2, quota={"limit": 1000, "remaining": 880}))
+        self.assertIn("daily quota 880/1000 left", sa.render_html(result))
+
+    def test_the_footer_stays_quiet_when_no_quota_was_reported(self):
+        result = sa.SearchResult(query=query(), options=[], notes=[], api_calls=4, availabilities_seen=0,
+                                 generated_at="2026-09-13T00:00:00+00:00")
+        self.assertNotIn("daily quota", sa.render_html(result))
+
+
+class FlexWindowTests(unittest.TestCase):
+    def test_flex_never_reaches_back_before_today(self):
+        today = date(2026, 9, 13)
+        q, _ = sa.parse_args(["SIN", "LHR", "--date", "2026-09-13", "--flex", "3"], today=today)
+        self.assertEqual((q.start_date, q.end_date), (today, date(2026, 9, 16)))
+
+    def test_flex_is_symmetric_when_the_whole_window_is_ahead(self):
+        q, _ = sa.parse_args(["SIN", "LHR", "--date", "2026-10-13", "--flex", "3"], today=date(2026, 9, 13))
+        self.assertEqual((q.start_date, q.end_date), (date(2026, 10, 10), date(2026, 10, 16)))
+
+
+class CrossCheckAccountingTests(unittest.TestCase):
+    def entry(self, **kw):
+        base = dict(date="2026-10-15", origin="JFK", destination="AMS", cabin="business", source="united",
+                    miles=110000, flight_numbers=("LO27", "LO267"), program_label="MileagePlus")
+        base.update(kw)
+        return cc.CrossCheckEntry(**base)
+
+    def option(self, **kw):
+        base = dict(program="Air Canada Aeroplan", source="aeroplan", cabin="business", travel_date="2026-10-15",
+                    route="JFK-AMS", airlines=["LO"], flight_numbers="LO27, LO267", departs_at="", arrives_at="",
+                    duration_minutes=0, stops=1, remaining_seats=2, mileage_cost=75000, taxes_minor_units=0,
+                    taxes_currency="USD", booking_link="")
+        base.update(kw)
+        return sa.AwardOption(**base)
+
+    def test_a_match_through_another_program_is_not_also_reported_as_missing(self):
+        option = self.option()
+        summary = cc.match_options([option], [self.entry()])
+        self.assertEqual(summary.flight_matches, 1)
+        self.assertEqual(option.confirmation, "flight")
+        self.assertIn("seen on FlightPoints via MileagePlus", option.crosscheck_note)
+        self.assertEqual(summary.unmatched, [], "the entry that confirmed the row is not also missing from seats.aero")
+
+    def test_a_genuinely_extra_flightpoints_option_is_still_reported(self):
+        extra = self.entry(source="delta", miles=99000, flight_numbers=("DL40",), program_label="SkyMiles")
+        summary = cc.match_options([self.option()], [self.entry(), extra])
+        self.assertEqual(len(summary.unmatched), 1)
+        self.assertIn("SkyMiles", summary.unmatched[0])
+
+
+class EmptyFlightPointsResultTests(unittest.TestCase):
+    """"FlightPoints found no premium space" must not read as "the file was unreadable"."""
+
+    def files(self, **named: str) -> Path:
+        tmp = Path(tempfile.mkdtemp())
+        for name, text in named.items():
+            (tmp / f"{name}.txt").write_text(text, encoding="utf-8")
+        return tmp
+
+    def test_a_search_with_results_but_no_premium_section_counts_as_an_answer(self):
+        text = ("Award Flight Search: SIN → HKG\nDate: 2026-11-06  |  Cabin: Business  |  Passengers: 2\n\n"
+                "Search complete. Found 14 award flight option(s).\n\n"
+                "| # | Program | Airline | Economy | Seats | Stops | Book |\n"
+                "| 1 | [AAdvantage](https://x) | American Airlines | 35,000 + $6 | 1 | Direct | [Book](https://x) |\n")
+        entries, files, empty = cc.load_files([self.files(economy_only=text)])
+        self.assertEqual((len(entries), files, empty), (0, 1, 1))
+        self.assertTrue(cc.CrossCheckSummary(entries=0, files=1, empty_files=1).answered)
+
+    def test_a_details_result_with_no_business_or_first_line_counts_as_an_answer(self):
+        # Premium economy is out of scope, so this file says "nothing for you here", not "unreadable".
+        text = ("Found 2 detailed flight option(s).\n\n"
+                "1. [AC](https://x): SIN → HKG\n   Departs: 2026-11-06 10:00:00\n"
+                "   Prem. Eco.: 85,000 pts + 22.00 taxes  |  2 seat(s)\n")
+        entries, files, empty = cc.load_files([self.files(economy_details=text)])
+        self.assertEqual((len(entries), files, empty), (0, 1, 1))
+
+    def test_a_changed_premium_block_still_reads_as_unreadable(self):
+        # The section is there but nothing parses: that is a format change, not "no space".
+        text = ("Award Flight Search: SIN → HKG\nDate: 2026-11-06  |  Cabin: Business\n\n"
+                "Premium cabins (points):\n- Aeroplan -- business class for 52500 points\n")
+        entries, files, empty = cc.load_files([self.files(new_format=text)])
+        self.assertEqual((len(entries), files, empty), (0, 1, 0))
+        self.assertFalse(cc.CrossCheckSummary(entries=0, files=1, empty_files=0).answered)
+
+
+class SortScriptBehaviourTests(unittest.TestCase):
+    """Run the dashboard's own sorter against a stub DOM, so the comparator is tested, not just its text."""
+
+    HARNESS = """
+    function cell(key) { return { hasAttribute: function () { return key !== null; },
+                                  getAttribute: function () { return key; } }; }
+    function row(keys) { return { cells: keys.map(cell) }; }
+    var ROWS = INPUT_ROWS.map(row);
+    var order = [];
+    var body = { rows: ROWS, appendChild: function (r) { order.push(ROWS.indexOf(r)); } };
+    var heads = [{ hasAttribute: function () { return true; }, getAttribute: function () { return '0'; },
+                   setAttribute: function () {}, classList: { toggle: function () {} },
+                   querySelector: function () { return null; }, addEventListener: function () {} }];
+    var document = { getElementById: function () { return { tBodies: [body], tHead: { rows: [{ cells: heads }] } }; } };
+    var location = { hash: '' };
+    SCRIPT
+    heads[0].addEventListener = null;
+    console.log(JSON.stringify(order));
+    """
+
+    def order_after_sorting(self, keys: list[str]) -> list[int]:
+        script = sa.SORT_SCRIPT.replace("})();", "sortBy(0, 'ascending');\n})();")
+        harness = self.HARNESS.replace("SCRIPT", script).replace("INPUT_ROWS", json.dumps([[k] for k in keys]))
+        out = subprocess.run([shutil.which("node"), "-e", harness], capture_output=True, text=True, timeout=30)
+        self.assertEqual(out.returncode, 0, out.stderr)
+        return json.loads(out.stdout.strip().splitlines()[-1])
+
+    @unittest.skipUnless(shutil.which("node"), "node is not installed")
+    def test_a_date_column_really_reorders(self):
+        # parseFloat("2026-11-20") is 2026 for every row, which used to leave the order untouched.
+        self.assertEqual(self.order_after_sorting(["2026-11-20", "2026-11-03", "2026-11-11"]), [1, 2, 0])
+
+    @unittest.skipUnless(shutil.which("node"), "node is not installed")
+    def test_numeric_columns_still_sort_numerically(self):
+        self.assertEqual(self.order_after_sorting(["108400", "87500", "162800"]), [1, 0, 2])
+
+    @unittest.skipUnless(shutil.which("node"), "node is not installed")
+    def test_codes_that_start_with_digits_sort_as_text(self):
+        self.assertEqual(self.order_after_sorting(["3u", "aa", "1x"]), [2, 0, 1])
+
+    @unittest.skipUnless(shutil.which("node"), "node is not installed")
+    def test_unknown_values_still_sort_last(self):
+        self.assertEqual(self.order_after_sorting(["500", "", "100"]), [2, 0, 1])
 
 
 if __name__ == "__main__":

@@ -415,10 +415,10 @@ def run_variant(name: str, extra: list[str], origin: str, destination: str, wind
         # A "?" row is only allowed where seats.aero itself did not say whether the space is nonstop.
         for option in [o for o in options if o["stops"] < 0]:
             record = api.availabilities.get(option["availability_id"], {})
-            code = search_awards.CABIN_CODES[option["cabin"]]
-            check(f"{code}Direct" not in record,
+            cabin_code = search_awards.CABIN_CODES[option["cabin"]]
+            check(f"{cabin_code}Direct" not in record,
                   f"{option['program']} {option['travel_date']} shows an unknown stop count although the record says "
-                  f"{code}Direct={record.get(f'{code}Direct')}")
+                  f"{cabin_code}Direct={record.get(f'{cabin_code}Direct')}")
         if any(o["stops"] < 0 for o in options):
             check(any("no nonstop flag" in note for note in payload["notes"]),
                   "rows with an unknown stop count were not explained in the notes")

@@ -78,6 +78,21 @@ def is_empty_result(text: str) -> bool:
     return any(marker in text for marker in EMPTY_MARKERS)
 
 
+def answered_without_premium_space(text: str) -> bool:
+    """True when FlightPoints clearly replied but listed no business or first space.
+
+    A search result whose "Premium cabins" block is missing, or a details result with no
+    Business/First price line, means the second source looked and found nothing in scope. If the
+    block *is* there and still parses to nothing, the format has changed and the file is unreadable,
+    which must keep reading as unreadable rather than as "no space".
+    """
+    if "Award Flight Search" in text:
+        return "premium cabins" not in text.lower()
+    if "detailed flight option" in text:
+        return not re.search(r"^\s*(Business|First):", text, re.I | re.M)
+    return False
+
+
 @dataclass
 class CrossCheckSummary:
     entries: int = 0
@@ -243,7 +258,7 @@ def load_files(paths: Sequence[Path]) -> tuple[list[CrossCheckEntry], int, int]:
         text = path.read_text(encoding="utf-8", errors="replace")
         found = parse_text(text)
         entries += found
-        if not found and is_empty_result(text):
+        if not found and (is_empty_result(text) or answered_without_premium_space(text)):
             empty += 1
     return entries, files, empty
 
@@ -312,6 +327,7 @@ def match_options(options: Sequence[Any], entries: Sequence[CrossCheckEntry]) ->
                     o.crosscheck_note = f"FlightPoints quotes {e.miles:,} miles"
                     summary.price_disagreements.append(f"{o.travel_date} {o.flight_numbers} {o.cabin} {o.program}: seats.aero {o.mileage_cost:,} vs FlightPoints {e.miles:,}")
             else:
+                used.add(id(e))   # this entry is the confirmation; it is not also "missing from seats.aero"
                 o.crosscheck_note = f"seen on FlightPoints via {e.program_label or e.source}"
             summary.flight_matches += 1
             continue

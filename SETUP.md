@@ -178,7 +178,7 @@ for it (usually 10 to 30 seconds, up to 2 minutes), then reports. Measured on re
 | A full month (`--end-date`) | 2–4 min | 60–150 |
 | Any of the above with `--no-refresh` | 2–15 s | 1–40 |
 
-The report footer shows your remaining quota after each run. At most 100 records are refreshed per run,
+The report footer shows your remaining quota after any run that refreshed records (seats.aero reports it with the refresh, so a `--no-refresh` run cannot show it). At most 100 records are refreshed per run,
 oldest first, and polling is free. The quota resets at midnight UTC. If you plan several month-long scans in
 one day, use `--no-refresh` for the exploratory ones and refresh only the search you intend to book from.
 

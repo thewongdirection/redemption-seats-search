@@ -173,7 +173,7 @@ class FakeSeatsAero:
             flight_numbers = ", ".join(f"{code}{rng.randrange(1, 999)}" for code in legs)
             if self.hostile and n == 0 and index % 5 == 0:
                 flight_numbers = XSS_TEXT
-            trips.append({
+            trip = {
                 "ID": f"{availability['ID']}-trip{n}",
                 "AvailabilityID": availability["ID"],
                 "Cabin": cabin,
@@ -199,7 +199,10 @@ class FakeSeatsAero:
                     }
                     for order, code in enumerate(reversed(legs))   # deliberately out of order; the script re-sorts
                 ],
-            })
+            }
+            if index % 11 == 0:
+                trip.pop("Stops")      # some records arrive without it; the segments have to answer instead
+            trips.append(trip)
         link = XSS_LINK if (self.hostile and index % 7 == 0) else f"https://seats.aero/booking/{availability['ID']}"
         return {
             "source": availability["Source"],

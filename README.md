@@ -172,7 +172,7 @@ without it.
 5. Drop itineraries with fewer seats than requested, and dynamically-priced (`Filtered`) ones.
 6. Sort by miles, then taxes, write the HTML report, and print a markdown table (or JSON with `--json`).
 
-The HTML report is a single self-contained file: no JavaScript, no external fonts or scripts, every value
+The HTML report is a single self-contained file: no external fonts, styles or scripts; the only JavaScript is the inline column sorter, every value
 HTML-escaped and only `https://` links emitted. Booking deep links come from seats.aero when available; otherwise
 the *Book* button falls back to the program's award-search page.
 
