@@ -258,7 +258,7 @@ class RefreshTests(unittest.TestCase):
         self.assertEqual(client.calls_made, 2, "one quota call per record refreshed; polls are free")
         self.assertEqual(outcome.quota["remaining"], 850)
         self.assertIn("2 refreshed", outcome.summary())
-        self.assertIn("850/1000", outcome.summary())
+        self.assertIn("850/1000", outcome.summary(), "the quota line lives in the notes, which both report formats carry")
 
     def test_refresh_request_body_shape(self):
         captured = {}
@@ -774,8 +774,11 @@ class CrossCheckMatchingTests(unittest.TestCase):
         aeroplan = self.make()
         summary = cc.match_options([united, aeroplan], self.entries())
         self.assertEqual(united.confirmation, "flight")
+        # The other programme's price is named on the row - retiring the entry is what keeps it out
+        # of "FlightPoints also lists", so this is the only place it would otherwise appear - but it
+        # is never compared with this row's price, which is what price_disagreements is for.
         self.assertIn("via", united.crosscheck_note)
-        self.assertNotIn("52,500", united.crosscheck_note)
+        self.assertIn("52,500 miles there", united.crosscheck_note)
         self.assertEqual(aeroplan.confirmation, "flight")
         self.assertEqual(aeroplan.crosscheck_note, "")
         self.assertEqual(summary.price_disagreements, [])
@@ -1189,13 +1192,17 @@ def summary_only_availability(direct: bool | None, source: str = "aeroplan", **e
     return record
 
 
+def run_summary_search(records: list[dict], **overrides):
+    """A search that returns program-level rows only, with no trip detail fetched."""
+    client, _, _ = make_client({"search": {"data": records, "hasMore": False, "cursor": 0}})
+    return sa.run_search(client, query(max_trip_lookups=0, **overrides))
+
+
 class DirectOnlySummaryRowTests(unittest.TestCase):
     """--direct-only must hold for program-level rows too, not just itineraries with flight numbers."""
 
     def run_with(self, records: list[dict], **overrides):
-        routes = {"search": {"data": records, "hasMore": False, "cursor": 0}}
-        client, _, _ = make_client(routes)
-        return sa.run_search(client, query(max_trip_lookups=0, **overrides))
+        return run_summary_search(records, **overrides)
 
     def test_connecting_program_row_is_dropped_when_nonstop_only(self):
         result = self.run_with([summary_only_availability(direct=False)], direct_only=True)
@@ -1224,7 +1231,7 @@ class DirectOnlySummaryRowTests(unittest.TestCase):
         result = self.run_with([summary_only_availability(direct=None)], direct_only=True)
         self.assertEqual([(o.detail_level, o.stops) for o in result.options], [("summary", -1)])
         self.assertEqual(sa.format_stops(result.options[0].stops), "?")
-        self.assertTrue(any("no nonstop flag" in n for n in result.notes))
+        self.assertTrue(any("says nothing either way" in n for n in result.notes))
 
     def test_nonstop_search_quotes_the_nonstop_price_seats_and_airlines(self):
         record = summary_only_availability(
@@ -1423,16 +1430,32 @@ class QuotaAccountingTests(unittest.TestCase):
         client.refresh_and_wait(["a", "b", "c"])
         self.assertEqual(client.calls_made, 3)
 
-    def test_the_report_footer_shows_the_quota_seats_aero_reported(self):
-        result = sa.SearchResult(query=query(), options=[], notes=[], api_calls=4, availabilities_seen=0,
-                                 generated_at="2026-09-13T00:00:00+00:00",
-                                 refresh=sa.RefreshOutcome(requested=2, quota={"limit": 1000, "remaining": 880}))
-        self.assertIn("daily quota 880/1000 left", sa.render_html(result))
+    def test_a_retried_call_is_charged_once_not_once_per_attempt(self):
+        """A 429 or 5xx was never served, so re-counting it would report a spent quota that is not."""
+        attempts = [http_error("https://seats.aero/partnerapi/refresh", 429, "slow down"),
+                    http_error("https://seats.aero/partnerapi/refresh", 503, "busy"),
+                    refresh_response({"a": "succeeded"}, complete=True)]
+        client, _, _ = make_client({"refresh": lambda: attempts.pop(0)})
+        client.refresh_and_wait(["a"])
+        self.assertEqual(client.calls_made, 1, "one record refreshed is one call, however many attempts it took")
 
-    def test_the_footer_stays_quiet_when_no_quota_was_reported(self):
-        result = sa.SearchResult(query=query(), options=[], notes=[], api_calls=4, availabilities_seen=0,
-                                 generated_at="2026-09-13T00:00:00+00:00")
-        self.assertNotIn("daily quota", sa.render_html(result))
+    def test_the_report_states_the_quota_seats_aero_reported_exactly_once(self):
+        """One owner: the refresh note, which both the HTML and the markdown report carry."""
+        outcome = sa.RefreshOutcome(requested=2, statuses={"a": "succeeded", "b": "succeeded"}, quota={"limit": 1000, "remaining": 880})
+        result = sa.SearchResult(query=query(), options=[], notes=[outcome.summary()], api_calls=4,
+                                 availabilities_seen=0, generated_at="2026-09-13T00:00:00+00:00", refresh=outcome)
+        html = sa.render_html(result)
+        self.assertIn("880/1000", html)
+        self.assertEqual(html.count("880/1000"), 1, "the footer must not restate what the note already says")
+        self.assertIn("880/1000", sa.render_markdown(result))
+
+    def test_the_report_stays_quiet_when_no_quota_was_reported(self):
+        outcome = sa.RefreshOutcome(requested=2, statuses={"a": "succeeded", "b": "succeeded"})
+        self.assertNotIn("quota", outcome.summary())
+
+    def test_a_quota_missing_its_remaining_count_is_not_rendered_as_none(self):
+        outcome = sa.RefreshOutcome(requested=2, statuses={"a": "succeeded", "b": "succeeded"}, quota={"limit": 1000})
+        self.assertNotIn("None", outcome.summary())
 
 
 class FlexWindowTests(unittest.TestCase):
@@ -1466,7 +1489,7 @@ class CrossCheckAccountingTests(unittest.TestCase):
         summary = cc.match_options([option], [self.entry()])
         self.assertEqual(summary.flight_matches, 1)
         self.assertEqual(option.confirmation, "flight")
-        self.assertIn("seen on FlightPoints via MileagePlus", option.crosscheck_note)
+        self.assertIn("also on FlightPoints via MileagePlus", option.crosscheck_note)
         self.assertEqual(summary.unmatched, [], "the entry that confirmed the row is not also missing from seats.aero")
 
     def test_a_genuinely_extra_flightpoints_option_is_still_reported(self):
@@ -1509,6 +1532,35 @@ class EmptyFlightPointsResultTests(unittest.TestCase):
         entries, files, empty, _skipped = cc.load_files([self.files(new_format=text)])
         self.assertEqual((len(entries), files, empty), (0, 1, 0))
         self.assertFalse(cc.CrossCheckSummary(entries=0, files=1, empty_files=0).answered)
+
+
+class ReportHonestyTests(unittest.TestCase):
+    """What a row claims must match the figures it actually quotes."""
+
+    def test_an_unreadable_timestamp_does_not_break_the_whole_updated_column(self):
+        """A non-numeric sort key drops the column back to sorting its text, for every row."""
+        key = sa._age_sort_key("not-a-timestamp")
+        self.assertNotEqual(key, float("inf"))
+        self.assertRegex(str(key), r"^-?\d+(\.\d+)?$", "the sorter's numeric test must accept it")
+        self.assertGreater(key, sa._age_sort_key("2020-01-01T00:00:00Z"), "unknown ages sort last")
+
+    def test_a_cabin_wide_row_never_claims_to_be_nonstop(self):
+        """{X}Direct means the cabin has some nonstop space, not that the cheapest space is."""
+        record = summary_only_availability(
+            direct=True, JMileageCost="60000", JAirlines="SQ, LH",
+            JDirectMileageCost="82000", JDirectAirlines="SQ",
+        )
+        row = run_summary_search([record]).options[0]
+        self.assertEqual((row.mileage_cost, row.airlines), (60000, ["SQ", "LH"]))
+        self.assertLess(row.stops, 0, "a connecting price must not be rendered as nonstop")
+
+    def test_a_nonstop_row_quotes_nonstop_taxes(self):
+        record = summary_only_availability(
+            direct=True, JTotalTaxes=45000, JDirectMileageCost="82000", JDirectTotalTaxes=12000,
+        )
+        row = run_summary_search([record], direct_only=True).options[0]
+        self.assertEqual((row.mileage_cost, row.taxes_minor_units), (82000, 12000),
+                         "miles and taxes must come from the same itinerary")
 
 
 class SortScriptBehaviourTests(unittest.TestCase):
@@ -2046,19 +2098,34 @@ class PreflightSafetyTests(unittest.TestCase):
         flushed = {path.name for path in pf._expired(crosscheck_dir, crosscheck.is_dump, time.time(), 0, True)}
         read = {path.name for path in sorted(crosscheck_dir.iterdir()) if crosscheck.is_dump(path)}
         self.assertEqual(flushed, read, "a search must read exactly the set a flush can clear")
-        self.assertEqual(read, {"search-SIN-HND.txt", "SEARCH-SIN-NRT.TXT"},
-                         "a dump is a .txt in any case, and never a symlink out of the folder")
+        self.assertEqual(read, {"search-SIN-HND.txt", "SEARCH-SIN-NRT.TXT", "dump.json"},
+                         "a dump is a .txt or .json in any case, and never a symlink out of the folder")
 
     def test_files_a_cross_check_directory_skips_are_reported_not_swallowed(self):
         crosscheck_dir = self.tmp / "crosscheck"
         crosscheck_dir.mkdir()
-        (crosscheck_dir / "search-SIN-HND.md").write_text("Premium cabins\n")   # saved with the wrong extension
+        (crosscheck_dir / "search-SIN-HND.md").write_text("Premium cabins\n")   # neither .txt nor .json
         _entries, files, _empty, skipped = crosscheck.load_files([crosscheck_dir])
         self.assertEqual((files, skipped), (0, 1))
 
         result = sa.SearchResult(query=query(), options=[], notes=[], api_calls=0, availabilities_seen=0, generated_at="now")
         sa.apply_cross_check(result, [crosscheck_dir])
         self.assertIn("were not read", " ".join(result.notes), "a directory of unread files must say so")
+
+    def test_a_half_read_cross_check_directory_still_says_what_it_skipped(self):
+        """The common case: some dumps read, some passed over - previously reported as a clean success."""
+        crosscheck_dir = self.tmp / "half"
+        crosscheck_dir.mkdir()
+        (crosscheck_dir / "search.txt").write_text(
+            (FIXTURES / "live" / "search_jfk_ams_2026-10-15.txt").read_text(encoding="utf-8"), encoding="utf-8")
+        (crosscheck_dir / "details.md").write_text("Premium cabins\n")      # the wrong extension
+        result = sa.SearchResult(query=query(origin="JFK", destination="AMS", start_date=date(2026, 10, 15),
+                                             end_date=date(2026, 10, 15)),
+                                 options=[], notes=[], api_calls=0, availabilities_seen=0, generated_at="now")
+        sa.apply_cross_check(result, [crosscheck_dir])
+        notes = " ".join(result.notes)
+        self.assertIn("Cross-checked against FlightPoints", notes, "entries were read, so this is a success")
+        self.assertIn("were not read", notes, "and it must still say one file was passed over")
 
     def test_a_file_that_vanishes_mid_flush_is_a_warning_not_a_dead_search(self):
         reports = self.tmp / "award-reports"
@@ -2108,6 +2175,44 @@ class PreflightSafetyTests(unittest.TestCase):
         with mock.patch.dict(os.environ, {"GIT_SSH_COMMAND": "plink -batch"}, clear=False):
             self.assertEqual(pf.git_env()["GIT_SSH_COMMAND"], "plink -batch",
                              "an ssh flag handed to a non-OpenSSH client would break a working fetch")
+
+    def test_a_symlinked_cross_check_directory_is_not_read_either(self):
+        """Reading through one a flush cannot clear leaves dumps that confirm rows forever."""
+        reports = self.tmp / "award-reports"
+        (reports / "real").mkdir(parents=True)
+        (reports / "real" / "search-SIN-HND.txt").write_text("Premium cabins\nBusiness: 60,000 miles\n")
+        (reports / pf.CROSSCHECK_DIR).symlink_to(reports / "real", target_is_directory=True)
+
+        flushed = pf._expired(reports / pf.CROSSCHECK_DIR, crosscheck.is_dump, time.time(), 0, True)
+        _entries, files, _empty, skipped = crosscheck.load_files([reports / pf.CROSSCHECK_DIR])
+        self.assertEqual((flushed, files), ([], 0), "neither side may go through a symlinked directory")
+        self.assertEqual(skipped, 1, "and the search must say it passed something over")
+
+    def test_a_normalised_json_dump_is_read_and_flushed(self):
+        """parse_normalised_json exists, so .json dumps must survive the directory filter."""
+        crosscheck_dir = self.tmp / "crosscheck"
+        crosscheck_dir.mkdir()
+        dump = crosscheck_dir / "entries.json"
+        dump.write_text('[{"date": "2026-11-14", "route": "SIN-LHR", "cabin": "business", '
+                        '"program": "aeroplan", "miles": 87500}]')
+        entries, files, _empty, skipped = crosscheck.load_files([crosscheck_dir])
+        self.assertEqual((len(entries), files, skipped), (1, 1, 0))
+        os.utime(dump, (0, 0))
+        report = pf.Report()
+        pf.flush_stale_data(self.tmp, report, 12, 60)
+        self.assertFalse(dump.exists(), "what a search reads, a flush must be able to clear")
+
+    def test_the_users_own_core_sshcommand_is_never_overridden(self):
+        """GIT_SSH_COMMAND beats core.sshCommand, so setting it would drop the identity they configured."""
+        with mock.patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("GIT_SSH_COMMAND", None)
+            self.assertNotIn("GIT_SSH_COMMAND", pf.git_env())
+
+    def test_a_negative_age_does_not_silently_mean_flush_everything(self):
+        for argv in (["--max-age-hours", "-1"], ["--crosscheck-max-age-minutes", "nan"], ["--timeout", "-5"]):
+            with self.subTest(argv=argv), contextlib.redirect_stderr(io.StringIO()):
+                with self.assertRaises(SystemExit):
+                    pf.parse_args(argv)
 
     def test_a_file_that_vanishes_before_its_age_is_read_is_not_a_dead_search(self):
         """The listing and the mtime question are two syscalls; another session can act in between."""

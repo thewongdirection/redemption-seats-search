@@ -29,7 +29,6 @@ import os
 import subprocess
 import sys
 import time
-import re
 from dataclasses import dataclass, field
 from datetime import date, timedelta
 from pathlib import Path
@@ -115,7 +114,10 @@ def git_env() -> dict[str, str]:
     env["GIT_TERMINAL_PROMPT"] = "0"
     env.setdefault("GIT_ASKPASS", "echo")            # unset would mean "ask the terminal"
     env.setdefault("SSH_ASKPASS", "echo")
-    env["GIT_SSH_COMMAND"] = _batch_ssh(env.get("GIT_SSH_COMMAND", "ssh"))
+    if "GIT_SSH_COMMAND" in env:
+        # Only ever adjusted, never introduced: setting it would override the checkout's own
+        # core.sshCommand, which may carry the identity the remote needs.
+        env["GIT_SSH_COMMAND"] = _batch_ssh(env["GIT_SSH_COMMAND"])
     return env
 
 
@@ -359,9 +361,8 @@ def check_seats_aero(key: str, report: Report, timeout: float = 30.0) -> None:
         return
     except sa.SeatsAeroError as err:
         detail = str(err)
-        status = re.search(r"HTTP (\d{3})", detail)
-        code = int(status.group(1)) if status else 0
-        if "rejected the API key" in detail:
+        code = err.status          # from the error itself, never re-read out of its message text
+        if err.key_rejected:
             report.fail("seats.aero", f"{detail} Nothing was searched.", 3)
         elif code == 429:
             # Not proof of a good key: a rate limit can be applied at the edge before the key is
@@ -450,7 +451,15 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--offline", action="store_true", help="Skip the remote fetch and the live seats.aero call")
     parser.add_argument("--timeout", type=float, default=30.0, help="HTTP timeout for the live check, in seconds")
     parser.add_argument("--json", action="store_true", help="Emit JSON instead of text")
-    return parser.parse_args(argv)
+    args = parser.parse_args(argv)
+    # A negative age makes every file older than the cutoff, so "keep more" would clear everything;
+    # nan makes the comparison false and disables the flush in silence.
+    for name, value in (("--max-age-hours", args.max_age_hours),
+                        ("--crosscheck-max-age-minutes", args.crosscheck_max_age_minutes),
+                        ("--timeout", args.timeout)):
+        if not value >= 0:                               # False for a negative and for nan
+            parser.error(f"{name} must be a number >= 0")
+    return args
 
 
 def main(argv: Sequence[str] | None = None) -> int:

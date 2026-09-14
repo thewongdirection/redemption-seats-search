@@ -247,12 +247,13 @@ def parse_text(text: str) -> list[CrossCheckEntry]:
 # A directory of dumps holds .txt files (SKILL.md step 2b writes them that way), and only those are
 # read from one. preflight.py clears exactly this set, so what a search reads is what a preflight
 # flushes; widening either without the other leaves stale dumps that confirm rows from an older search.
-DUMP_SUFFIX = ".txt"
+DUMP_SUFFIXES = (".txt", ".json")     # verbatim tool output, and the normalised form parse_text reads
+DUMP_SUFFIX = DUMP_SUFFIXES[0]        # what SKILL.md tells the model to write
 
 
 def is_dump(path: Path) -> bool:
-    """A cross-check dump this skill owns: a real file, not a symlink, named `*.txt` in any case."""
-    return path.is_file() and not path.is_symlink() and path.suffix.lower() == DUMP_SUFFIX
+    """A cross-check dump this skill owns: a real file, not a symlink, with a dump suffix in any case."""
+    return path.is_file() and not path.is_symlink() and path.suffix.lower() in DUMP_SUFFIXES
 
 
 def load_files(paths: Sequence[Path]) -> tuple[list[CrossCheckEntry], int, int, int]:
@@ -266,6 +267,11 @@ def load_files(paths: Sequence[Path]) -> tuple[list[CrossCheckEntry], int, int, 
     files = empty = skipped = 0
     for path in paths:
         if path.is_dir():
+            if path.is_symlink():
+                # preflight refuses to clear through a symlinked directory, so reading through one
+                # would leave dumps that can confirm a row but can never be flushed.
+                skipped += sum(1 for p in path.iterdir() if p.is_file())
+                continue
             here = sorted(p for p in path.iterdir() if p.is_file())
             skipped += sum(1 for p in here if not is_dump(p))
             more, n, e, s = load_files([p for p in here if is_dump(p)])
@@ -335,8 +341,9 @@ def match_options(options: Sequence[Any], entries: Sequence[CrossCheckEntry]) ->
         candidates = by_flight.get((o.travel_date, o.cabin, numbers), [])
         if candidates:
             # The same flights can be sold by several programs at different prices, so prefer the entry
-            # from this row's own program; a different program still confirms the seat exists, but its
-            # price is not comparable and is left for the "FlightPoints also lists" note.
+            # from this row's own program. A different program still confirms the seat exists, but its
+            # price is not this row's and is never compared with it; it is named on the row instead,
+            # because retiring the entry is the only thing keeping it out of "FlightPoints also lists".
             same_program = [e for e in candidates if e.source == o.source]
             e = same_program[0] if same_program else candidates[0]
             o.sources.append("flightpoints")
@@ -348,7 +355,9 @@ def match_options(options: Sequence[Any], entries: Sequence[CrossCheckEntry]) ->
                     summary.price_disagreements.append(f"{o.travel_date} {o.flight_numbers} {o.cabin} {o.program}: seats.aero {o.mileage_cost:,} vs FlightPoints {e.miles:,}")
             else:
                 used.add(id(e))   # this entry is the confirmation; it is not also "missing from seats.aero"
-                o.crosscheck_note = f"seen on FlightPoints via {e.program_label or e.source}"
+                # Its price is the only place that programme's number appears, so it goes on the row.
+                via = e.program_label or e.source
+                o.crosscheck_note = f"also on FlightPoints via {via}" + (f", at {e.miles:,} miles there" if e.miles else "")
             summary.flight_matches += 1
             continue
         candidates = by_program.get((o.travel_date, o.route, o.cabin, o.source), [])

@@ -198,7 +198,17 @@ class UsageError(Exception):
 
 
 class SeatsAeroError(Exception):
-    """The API refused or failed the request; exit code 3."""
+    """The API refused or failed the request; exit code 3.
+
+    `status` is the HTTP code when there was one, and `key_rejected` says the key itself was
+    refused. Callers branch on these rather than on the message text: the message embeds the API's
+    own response body, so a 404 whose body happens to mention "HTTP 429" would read as throttling.
+    """
+
+    def __init__(self, message: str, *, status: int = 0, key_rejected: bool = False) -> None:
+        super().__init__(message)
+        self.status = status
+        self.key_rejected = key_rejected
 
 
 # --------------------------------------------------------------------------- auth
@@ -272,10 +282,12 @@ class SeatsAeroClient:
             headers["content-type"] = "application/json"
             data = json.dumps(body).encode("utf-8")
         request = urllib.request.Request(url, data=data, headers=headers, method="POST" if body is not None else "GET")
+        if counted:
+            # Charged once for the request, not once per attempt: a 429 or a 5xx was never served,
+            # and re-counting a retried refresh of 250 records would report thousands of calls spent.
+            self.calls_made += cost
         for attempt in range(self._max_retries + 1):
             try:
-                if counted:
-                    self.calls_made += cost
                 with self._opener(request, self._timeout) as response:
                     return json.loads(response.read().decode("utf-8"))
             except urllib.error.HTTPError as err:
@@ -283,14 +295,16 @@ class SeatsAeroClient:
                 if err.code in (401, 403):
                     raise SeatsAeroError(
                         f"seats.aero rejected the API key (HTTP {err.code}). "
-                        "Check the key and that your seats.aero Pro membership is active."
+                        "Check the key and that your seats.aero Pro membership is active.",
+                        status=err.code, key_rejected=True,
                     ) from None
                 if err.code == 429 or err.code >= 500:
                     if attempt < self._max_retries:
                         self._sleep(_backoff_seconds(err, attempt))
                         continue
-                    raise SeatsAeroError(f"seats.aero HTTP {err.code} after {attempt + 1} attempts: {body}") from None
-                raise SeatsAeroError(f"seats.aero HTTP {err.code} for {path}: {body}") from None
+                    raise SeatsAeroError(f"seats.aero HTTP {err.code} after {attempt + 1} attempts: {body}",
+                                         status=err.code) from None
+                raise SeatsAeroError(f"seats.aero HTTP {err.code} for {path}: {body}", status=err.code) from None
             except urllib.error.URLError as err:
                 if attempt < self._max_retries:
                     self._sleep(_backoff_seconds(None, attempt))
@@ -434,8 +448,8 @@ class RefreshOutcome:
         text = f"Refreshed before reporting ({self.requested} record{'s' if self.requested != 1 else ''}): " + ", ".join(parts) + "."
         if self.capped_from:
             text += f" Only the {self.requested} oldest of {self.capped_from} matches were refreshed to protect the daily quota."
-        if self.quota:
-            text += f" Daily API quota: {self.quota.get('remaining')}/{self.quota.get('limit')} calls remaining."
+        if self.quota.get("limit") and self.quota.get("remaining") is not None:
+            text += f" Daily API quota: {self.quota['remaining']}/{self.quota['limit']} calls remaining."
         return text
 
     def to_json(self) -> dict[str, Any]:
@@ -682,11 +696,15 @@ def run_search(client: SeatsAeroClient, query: SearchQuery, log: Callable[[str],
     if query.pax > 1:
         notes.append(f"Filtered to itineraries reporting at least {query.pax} seats; programs that hide seat counts are kept and flagged.")
     if query.direct_only:
-        unknown = sum(1 for o in options if o.stops < 0)
+        unknown = [o for o in options if o.stops < 0]
         note = "Filtered to nonstop itineraries; anything seats.aero reports as connecting was dropped."
         if unknown:
-            note += (f" {unknown} program-level row(s) are shown with '?' stops because seats.aero publishes no "
-                     "nonstop flag for them; confirm on the program's site.")
+            summaries = sum(1 for o in unknown if o.detail_level == "summary")
+            what = (f"{summaries} program-level row(s)" if summaries == len(unknown)
+                    else f"{len(unknown)} row(s)" if not summaries
+                    else f"{len(unknown)} row(s), {summaries} of them program-level,")
+            note += (f" {what} are shown with '?' stops because seats.aero says nothing either way about "
+                     "whether they are nonstop; confirm on the program's site.")
         notes.append(note)
     if query.date_mode == "schedule-opening":
         notes.append(f"No date was given, so this scanned {SCHEDULE_OPENING_DAYS[0]}-{SCHEDULE_OPENING_DAYS[1]} days out, where airlines first release award inventory.")
@@ -824,10 +842,13 @@ def _summary_options(availability: dict[str, Any], cabins_open: Sequence[str], q
                 departs_at="",
                 arrives_at="",
                 duration_minutes=0,
-                stops=0 if direct else -1,
+                # Nonstop only where this row quotes the nonstop figures. `{X}Direct` alone means the
+                # cabin has some nonstop space, not that the cheapest space - which is what a
+                # cabin-wide row quotes - is nonstop.
+                stops=0 if nonstop_only else -1,
                 remaining_seats=seats,
                 mileage_cost=_availability_cost(availability, cabin, direct=nonstop_only),
-                taxes_minor_units=_to_int(availability.get(f"{code}TotalTaxes")),
+                taxes_minor_units=_to_int(_cabin_field(availability, code, "TotalTaxes", nonstop_only)),
                 taxes_currency=str(availability.get("TaxesCurrency") or ""),
                 booking_link="",
                 availability_id=str(availability.get("ID", "")),
@@ -980,6 +1001,15 @@ def sort_options(options: list[AwardOption]) -> None:
 CROSS_CHECK_NOTE_MARKERS = ("FlightPoints", "Cross-check")
 
 
+def _skipped_note(skipped: int) -> str:
+    """Files in a cross-check directory that were passed over, so a half-read cross-check says so."""
+    if not skipped:
+        return ""
+    wanted = " or ".join(crosscheck.DUMP_SUFFIXES)
+    return (f" {skipped} file(s) in the cross-check directory were not read: a directory contributes its "
+            f"{wanted} dumps and never a symlink, so save FlightPoints output that way, or name the file directly.")
+
+
 def apply_cross_check(result: SearchResult, paths: Sequence[Path], log: Callable[[str], None] = lambda _: None) -> None:
     """Match FlightPoints output files against the seats.aero rows and regroup the report."""
     # A --load run may already carry notes from an earlier cross-check; this one supersedes them.
@@ -1006,11 +1036,8 @@ def apply_cross_check(result: SearchResult, paths: Sequence[Path], log: Callable
             result.notes.insert(0, f"FlightPoints was queried ({files} searches) and reported no business or first space on this route and date(s), "
                                    "so none of these rows is confirmed by a second source. Treat them as seats.aero-only until you check the program's site.")
         else:
-            note = f"Cross-check requested but no FlightPoints entries could be read from {files} file(s); rows are seats.aero only."
-            if skipped_files:
-                note += (f" {skipped_files} file(s) in the cross-check directory were not read: a directory contributes "
-                         f"its {crosscheck.DUMP_SUFFIX} dumps, so save FlightPoints output with that extension, or name the file directly.")
-            result.notes.insert(0, note)
+            result.notes.insert(0, f"Cross-check requested but no FlightPoints entries could be read from {files} file(s); "
+                                   f"rows are seats.aero only.{_skipped_note(skipped_files)}")
         return
     note = (f"Cross-checked against FlightPoints ({len(entries)} entries): {confirmed} of {len(result.options)} rows confirmed by both sources"
             f" ({summary.flight_matches} by exact flight, {summary.program_matches} by program and price) and grouped at the top.")
@@ -1020,6 +1047,7 @@ def apply_cross_check(result: SearchResult, paths: Sequence[Path], log: Callable
         note += f" FlightPoints also lists {len(summary.unmatched)} premium option(s) seats.aero did not: " + "; ".join(summary.unmatched[:4]) + ("…" if len(summary.unmatched) > 4 else "") + "."
     if summary.out_of_scope:
         note += f" ({summary.out_of_scope} FlightPoints entry(ies) for other routes or dates were ignored.)"
+    note += _skipped_note(skipped_files)
     result.notes.insert(0, note)
 
 
@@ -1195,10 +1223,22 @@ def table_columns(q: SearchQuery, with_sources: bool = False) -> list[Column]:
         Column("Taxes / pax", lambda i, o: format_taxes(o.taxes_minor_units, o.taxes_currency),
                lambda i, o: "", "num", in_html=False, sort=lambda i, o: o.taxes_minor_units),
         Column("Updated", lambda i, o: format_age(o.updated_at), lambda i, o: _updated_html(o),
-               sort=lambda i, o: round(max(_hours_since(o.updated_at), 0.0), 3) if o.updated_at else 10**6),   # freshest first
+               sort=lambda i, o: _age_sort_key(o.updated_at)),   # freshest first, unknown ages last
         Column("Book", lambda i, o: _book_markdown(o), lambda i, o: _book_html(o), "book-cell"),
     ]
     return cols
+
+
+# Bigger than any real age in hours, and finite: the sorter's numeric test rejects "inf", and one
+# unreadable timestamp would then drop the whole column back to sorting its text.
+UNKNOWN_AGE_SORT_KEY = 10**6
+
+
+def _age_sort_key(updated_at: str) -> float:
+    hours = _hours_since(updated_at) if updated_at else float("inf")
+    if hours == float("inf"):
+        return UNKNOWN_AGE_SORT_KEY
+    return round(max(hours, 0.0), 3)
 
 
 def _minutes_of_day(value: str) -> int:
@@ -1304,13 +1344,14 @@ h1 .arrow{color:var(--accent);margin:0 8px}
 table{border-collapse:separate;border-spacing:0;width:100%;font-size:13px}
 th,td{padding:7px 6px;text-align:left;vertical-align:top;border-bottom:1px solid var(--border);white-space:nowrap;background:var(--surface)}
 th{font-size:11px;text-transform:uppercase;letter-spacing:.05em;color:var(--muted);background:var(--surface-2);position:sticky;top:0;z-index:1}
-th[data-col]{cursor:pointer;user-select:none}
-th[data-col] button{all:unset;cursor:pointer;font:inherit;color:inherit;letter-spacing:inherit;text-transform:inherit}
+/* The button fills the cell and carries the arrow, so every pixel that looks clickable is. */
+th[data-col]{user-select:none;padding:0}
+th[data-col] button{all:unset;cursor:pointer;display:block;width:100%;box-sizing:border-box;padding:7px 6px;font:inherit;color:inherit;letter-spacing:inherit;text-transform:inherit}
 th[data-col]:hover{color:var(--text)}
-th[data-col] button:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
-th[data-col]::after{content:"↕";opacity:.35;margin-left:4px;font-size:10px}
-th[aria-sort=ascending]::after{content:"↑";opacity:1}
-th[aria-sort=descending]::after{content:"↓";opacity:1}
+th[data-col] button:focus-visible{outline:2px solid var(--accent);outline-offset:-2px}
+th[data-col] button::after{content:"↕";opacity:.35;margin-left:4px;font-size:10px}
+th[aria-sort=ascending] button::after{content:"↑";opacity:1}
+th[aria-sort=descending] button::after{content:"↓";opacity:1}
 th.sorted{color:var(--accent)}
 .tablehint{color:var(--muted);font-size:12px;margin:8px 0 0}
 td.wrap,th.wrap{white-space:normal;min-width:96px;max-width:150px}
@@ -1488,14 +1529,6 @@ SORT_SCRIPT = """
 """
 
 
-def _quota_text(result: SearchResult) -> str:
-    """The daily quota seats.aero reported on this run, when it reported one."""
-    quota = (result.refresh.quota if result.refresh else None) or {}
-    if not quota.get("limit"):
-        return ""
-    return f" · daily quota {_esc(quota.get('remaining'))}/{_esc(quota.get('limit'))} left"
-
-
 def _css(css: str) -> str:
     return f' class="{css}"' if css else ""
 
@@ -1541,7 +1574,7 @@ def render_html(result: SearchResult) -> str:
         "Book links open the mileage program that holds the space; airline links open the operating carrier."
         + (" Rows marked ✓ 2 sources were also found by FlightPoints and are listed first." if result.crosscheck is not None else "") + "</p>"
         f'<div class="chips">{chips_html}</div>{body}{notes_html}'
-        f"<footer>Generated {_esc(result.generated_at)} · {result.api_calls} seats.aero API calls{_quota_text(result)} · cached data, verify before transferring points.</footer>"
+        f"<footer>Generated {_esc(result.generated_at)} · {result.api_calls} seats.aero API calls · cached data, verify before transferring points.</footer>"
         "</main></body></html>"
     )
 
