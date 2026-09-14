@@ -34,7 +34,7 @@ PROGRAM_NAME_TO_SOURCE = {
     "frequent flyer": "qantas", "privilege club / avios": "qatar", "privilege club": "qatar", "mileageplus": "united",
     "krisflyer": "singapore", "flying blue": "flyingblue", "flying club": "virginatlantic", "trueblue": "jetblue",
     "skymiles": "delta", "skywards": "emirates", "etihad guest": "etihad", "miles & more": "lufthansa",
-    "velocity": "velocity", "eurobonus": "eurobonus", "finnair plus": "finnair", "smiles": "smiles",
+    "velocity": "velocity", "velocity frequent flyer": "velocity", "eurobonus": "eurobonus", "finnair plus": "finnair", "smiles": "smiles",
     "executive club": "british", "british airways club": "british", "miles&smiles": "turkish",
     "aeromexico rewards": "aeromexico", "connectmiles": "connectmiles", "tudoazul": "azul", "shebamiles": "ethiopian",
     "alfursan": "saudia", "frontier miles": "frontier", "free spirit": "spirit",
@@ -78,11 +78,27 @@ def is_empty_result(text: str) -> bool:
     return any(marker in text for marker in EMPTY_MARKERS)
 
 
+def answered_without_premium_space(text: str) -> bool:
+    """True when FlightPoints clearly replied but listed no business or first space.
+
+    A search result whose "Premium cabins" block is missing, or a details result with no
+    Business/First price line, means the second source looked and found nothing in scope. If the
+    block *is* there and still parses to nothing, the format has changed and the file is unreadable,
+    which must keep reading as unreadable rather than as "no space".
+    """
+    if "Award Flight Search" in text:
+        return "premium cabins" not in text.lower()
+    if "detailed flight option" in text:
+        return not re.search(r"^\s*(Business|First):", text, re.I | re.M)
+    return False
+
+
 @dataclass
 class CrossCheckSummary:
     entries: int = 0
     files: int = 0
     empty_files: int = 0     # queries FlightPoints answered with no availability
+    skipped_files: int = 0   # files in a cross-check directory that are not dumps this skill reads
     flight_matches: int = 0
     program_matches: int = 0
     price_disagreements: list[str] = field(default_factory=list)
@@ -97,6 +113,7 @@ class CrossCheckSummary:
     def to_json(self) -> dict[str, Any]:
         return {
             "provider": "flightpoints", "files": self.files, "entries": self.entries, "empty_files": self.empty_files,
+            "skipped_files": self.skipped_files,
             "flight_matches": self.flight_matches, "program_matches": self.program_matches,
             "price_disagreements": self.price_disagreements, "unmatched": self.unmatched,
             "out_of_scope": self.out_of_scope,
@@ -227,25 +244,43 @@ def parse_text(text: str) -> list[CrossCheckEntry]:
     return []
 
 
-def load_files(paths: Sequence[Path]) -> tuple[list[CrossCheckEntry], int, int]:
-    """Returns (entries, files read, files that were an explicit empty result)."""
+# A directory of dumps holds .txt files (SKILL.md step 2b writes them that way), and only those are
+# read from one. preflight.py clears exactly this set, so what a search reads is what a preflight
+# flushes; widening either without the other leaves stale dumps that confirm rows from an older search.
+DUMP_SUFFIX = ".txt"
+
+
+def is_dump(path: Path) -> bool:
+    """A cross-check dump this skill owns: a real file, not a symlink, named `*.txt` in any case."""
+    return path.is_file() and not path.is_symlink() and path.suffix.lower() == DUMP_SUFFIX
+
+
+def load_files(paths: Sequence[Path]) -> tuple[list[CrossCheckEntry], int, int, int]:
+    """Returns (entries, files read, files that were an explicit empty result, files skipped).
+
+    A path named directly is read whatever it is called; a directory contributes its dumps, and
+    counts anything else it holds as skipped so the caller can say so rather than read zero files
+    beside a directory that visibly has some.
+    """
     entries: list[CrossCheckEntry] = []
-    files = empty = 0
+    files = empty = skipped = 0
     for path in paths:
         if path.is_dir():
-            sub = sorted(p for p in path.iterdir() if p.is_file())
-            more, n, e = load_files(sub)
+            here = sorted(p for p in path.iterdir() if p.is_file())
+            skipped += sum(1 for p in here if not is_dump(p))
+            more, n, e, s = load_files([p for p in here if is_dump(p)])
             entries += more
             files += n
             empty += e
+            skipped += s
             continue
         files += 1
         text = path.read_text(encoding="utf-8", errors="replace")
         found = parse_text(text)
         entries += found
-        if not found and is_empty_result(text):
+        if not found and (is_empty_result(text) or answered_without_premium_space(text)):
             empty += 1
-    return entries, files, empty
+    return entries, files, empty, skipped
 
 
 def entry_in_scope(entry: CrossCheckEntry, query: Any) -> bool:
@@ -312,6 +347,7 @@ def match_options(options: Sequence[Any], entries: Sequence[CrossCheckEntry]) ->
                     o.crosscheck_note = f"FlightPoints quotes {e.miles:,} miles"
                     summary.price_disagreements.append(f"{o.travel_date} {o.flight_numbers} {o.cabin} {o.program}: seats.aero {o.mileage_cost:,} vs FlightPoints {e.miles:,}")
             else:
+                used.add(id(e))   # this entry is the confirmation; it is not also "missing from seats.aero"
                 o.crosscheck_note = f"seen on FlightPoints via {e.program_label or e.source}"
             summary.flight_matches += 1
             continue

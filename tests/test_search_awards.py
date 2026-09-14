@@ -5,9 +5,14 @@ run offline and never need a real API key.
 """
 from __future__ import annotations
 
+import contextlib
+import fnmatch
 import io
 import json
 import os
+import shutil
+import subprocess
+import time
 import sys
 import tempfile
 import unittest
@@ -19,7 +24,10 @@ from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "scripts"))
+sys.path.insert(0, str(ROOT / "tests"))
 
+import crosscheck  # noqa: E402
+import preflight as pf  # noqa: E402
 import search_awards as sa  # noqa: E402
 
 FIXTURES = ROOT / "tests" / "fixtures"
@@ -44,10 +52,13 @@ class FakeOpener:
     def __init__(self, routes: dict[str, object]):
         self.routes = routes
         self.requests: list[str] = []
+        self.bodies: list[str] = []
 
     def __call__(self, request, timeout):
         url = request.full_url
         self.requests.append(url)
+        if request.data:
+            self.bodies.append(request.data.decode("utf-8"))
         assert request.get_header("Partner-authorization"), "API key header missing"
         path = url.split("/partnerapi/", 1)[1].split("?", 1)[0]
         handler = self.routes.get(path)
@@ -244,7 +255,7 @@ class RefreshTests(unittest.TestCase):
         self.assertEqual(outcome.succeeded, 2)
         self.assertFalse(outcome.timed_out)
         self.assertEqual(sleeps, [5, 5])
-        self.assertEqual(client.calls_made, 1, "polls are free and must not inflate the call count")
+        self.assertEqual(client.calls_made, 2, "one quota call per record refreshed; polls are free")
         self.assertEqual(outcome.quota["remaining"], 850)
         self.assertIn("2 refreshed", outcome.summary())
         self.assertIn("850/1000", outcome.summary())
@@ -578,8 +589,8 @@ class RenderingTests(unittest.TestCase):
         self.assertIn("| Flights | Date | Route | Dep → Arr |", text)
         self.assertIn("| 2026-11-14 | SIN-LHR |", text)
         html = sa.render_html(result)
-        self.assertIn(">Date</th>", html)
-        self.assertIn(">Route</th>", html)
+        self.assertIn(">Date</button></th>", html)
+        self.assertIn(">Route</button></th>", html)
 
     def test_markdown_overnight_arrival_marker(self):
         text = sa.render_markdown(self.result)
@@ -702,7 +713,7 @@ class CrossCheckParsingTests(unittest.TestCase):
         self.assertEqual(cc.parse_text("{not json"), [])
 
     def test_load_files_walks_directories(self):
-        entries, files, empty = cc.load_files([FIXTURES])
+        entries, files, empty, _skipped = cc.load_files([FIXTURES])
         self.assertGreaterEqual(files, 3)
         self.assertGreaterEqual(len(entries), 9)
         self.assertEqual(empty, 0)
@@ -712,7 +723,7 @@ class CrossCheckParsingTests(unittest.TestCase):
         (tmp / "a.txt").write_text("Award Flight Search: SIN → HKG\nDate: 2026-11-06  |  Cabin: Business  |  Passengers: 2\n\nSearch complete. Found 0 award flight option(s).\n\nNo flights found matching your criteria.\n")
         (tmp / "b.txt").write_text("No detailed flight information found.\n")
         (tmp / "c.txt").write_text("Error: FlightPoints API 400 for /search/key/\n")
-        entries, files, empty = cc.load_files([tmp])
+        entries, files, empty, _skipped = cc.load_files([tmp])
         self.assertEqual((len(entries), files, empty), (0, 3, 2))
         self.assertTrue(cc.is_empty_result("Search complete. Found 0 award flight option(s)."))
         self.assertFalse(cc.is_empty_result("Error: FlightPoints API 400"))
@@ -853,7 +864,7 @@ class CrossCheckRenderingTests(unittest.TestCase):
         self.assertEqual(loaded.crosscheck.program_matches, result.crosscheck.program_matches)
         html = sa.render_html(loaded)
         self.assertIn("✓ 2 sources", html)
-        self.assertIn(">Sources</th>", html)          # the badge and green rows are explained
+        self.assertIn(">Sources</button></th>", html)   # the badge and green rows are explained
         self.assertIn("Confirmed by FlightPoints", html)
 
     def test_load_without_a_summary_still_explains_confirmed_rows(self):
@@ -866,7 +877,7 @@ class CrossCheckRenderingTests(unittest.TestCase):
         path.write_text(json.dumps(payload))
         loaded = sa.load_result(path)
         self.assertIsNotNone(loaded.crosscheck)
-        self.assertIn(">Sources</th>", sa.render_html(loaded))
+        self.assertIn(">Sources</button></th>", sa.render_html(loaded))
 
     def test_unreadable_cross_check_files_add_a_note_not_a_crash(self):
         client, _, _ = make_client(default_routes())
@@ -940,7 +951,11 @@ class SortableDashboardTests(unittest.TestCase):
         self.assertEqual(sortable, [c.header for c in self.columns if c.header != "Book"])
         for index, column in enumerate(self.columns):
             if column.sort is not None:
-                self.assertIn(f'data-col="{index}" tabindex="0" role="button" aria-sort="none"', self.html)
+                # aria-sort only means something on a columnheader, so the th keeps that role
+                # and the control is a button inside it.
+                self.assertIn(f'data-col="{index}" aria-sort="none"', self.html)
+                self.assertIn(f'<button type="button" title="Sort by {column.header}">{column.header}</button>', self.html)
+        self.assertNotIn('role="button"', self.html)
         self.assertEqual(self.html.count('aria-sort="none"'), len(sortable))
         self.assertNotIn('title="Sort by Book"', self.html)
 
@@ -981,7 +996,10 @@ class SortableDashboardTests(unittest.TestCase):
         self.assertIn("getElementById('awards')", self.html)
         self.assertIn("Click a column heading to sort", self.html)
         self.assertNotIn("<script src", self.html)     # self-contained: no external dependency
-        self.assertIn("e.key === 'Enter'", self.html)  # keyboard accessible
+        # Keyboard support now comes from the native <button> in each sortable header,
+        # so the script no longer needs its own Enter/Space handling.
+        self.assertIn('<button type="button" title="Sort by Program">', self.html)
+        self.assertNotIn("e.key === 'Enter'", self.html)
 
     def test_default_order_hint_mentions_cross_check_only_when_present(self):
         self.assertIn("the cheapest first", self.html)
@@ -1003,7 +1021,7 @@ class HtmlReportTests(unittest.TestCase):
         self.assertTrue(self.html.startswith("<!doctype html>"))
         self.assertIn("color-scheme:dark", self.html)
         self.assertIn("<title>Award seats SIN → LHR · 2026-11-14</title>", self.html)
-        self.assertIn(">Book</th>", self.html)
+        self.assertIn(">Book</th>", self.html)          # not sortable, so no button
         self.assertNotIn("position:sticky;right:0", self.html)   # table is narrow enough not to need a pinned column
 
     def test_rows_link_to_program_booking_page_and_airline_site(self):
@@ -1142,6 +1160,1018 @@ class MainEntryPointTests(unittest.TestCase):
             fake_date.fromisoformat = date.fromisoformat
             self.assertEqual(sa.main(["SIN", "LHR", "--date", "2026-11-14"]), 2)
             self.assertIn("No seats.aero API key", err.getvalue())
+
+
+# --------------------------------------------------------------------------- nonstop-only, program-level rows
+
+
+def summary_only_availability(direct: bool | None, source: str = "aeroplan", **extra) -> dict:
+    """One availability record with business space and no trip detail behind it.
+
+    direct=None leaves JDirect out, the way seats.aero omits it on some records.
+    """
+    record = {
+        "ID": f"avail-{source}-{'direct' if direct else 'connecting'}",
+        "Date": "2026-11-14",
+        "Source": source,
+        "Route": {"OriginAirport": "SIN", "DestinationAirport": "LHR"},
+        "JAvailable": True,
+        "JMileageCost": "60000",
+        "JRemainingSeats": 2,
+        "JAirlines": "SQ, LH",
+        "JTotalTaxes": 5000,
+        "TaxesCurrency": "SGD",
+        "UpdatedAt": "2026-11-01T00:00:00Z",
+    }
+    if direct is not None:
+        record["JDirect"] = direct
+    record.update(extra)
+    return record
+
+
+class DirectOnlySummaryRowTests(unittest.TestCase):
+    """--direct-only must hold for program-level rows too, not just itineraries with flight numbers."""
+
+    def run_with(self, records: list[dict], **overrides):
+        routes = {"search": {"data": records, "hasMore": False, "cursor": 0}}
+        client, _, _ = make_client(routes)
+        return sa.run_search(client, query(max_trip_lookups=0, **overrides))
+
+    def test_connecting_program_row_is_dropped_when_nonstop_only(self):
+        result = self.run_with([summary_only_availability(direct=False)], direct_only=True)
+        self.assertEqual(result.options, [])
+        self.assertEqual(result.premium_matches, 1)
+        self.assertIn("nonstop routing", result.explain_no_results())
+
+    def test_direct_program_row_survives_and_reports_nonstop(self):
+        result = self.run_with([summary_only_availability(direct=True)], direct_only=True)
+        self.assertEqual([(o.detail_level, o.stops) for o in result.options], [("summary", 0)])
+
+    def test_without_the_flag_a_connecting_program_row_is_kept_with_an_unknown_stop_count(self):
+        result = self.run_with([summary_only_availability(direct=False)])
+        self.assertEqual([(o.detail_level, o.stops) for o in result.options], [("summary", -1)])
+        self.assertEqual(sa.format_stops(result.options[0].stops), "?")
+
+    def test_mixed_records_keep_only_the_nonstop_one(self):
+        result = self.run_with(
+            [summary_only_availability(direct=False, source="united"), summary_only_availability(direct=True)],
+            direct_only=True,
+        )
+        self.assertEqual([o.source for o in result.options], ["aeroplan"])
+
+    def test_a_record_with_no_direct_flag_is_kept_and_marked_unknown(self):
+        # seats.aero omits {X}Direct on some records; that is "it did not say", not "connecting".
+        result = self.run_with([summary_only_availability(direct=None)], direct_only=True)
+        self.assertEqual([(o.detail_level, o.stops) for o in result.options], [("summary", -1)])
+        self.assertEqual(sa.format_stops(result.options[0].stops), "?")
+        self.assertTrue(any("no nonstop flag" in n for n in result.notes))
+
+    def test_nonstop_search_quotes_the_nonstop_price_seats_and_airlines(self):
+        record = summary_only_availability(
+            direct=True,
+            JDirectMileageCost="82000", JDirectRemainingSeats=4, JDirectAirlines="SQ",
+        )
+        result = self.run_with([record], direct_only=True)
+        row = result.options[0]
+        self.assertEqual((row.mileage_cost, row.remaining_seats, row.airlines), (82000, 4, ["SQ"]))
+
+    def test_without_the_flag_the_cabin_wide_figures_are_kept(self):
+        record = summary_only_availability(
+            direct=True,
+            JDirectMileageCost="82000", JDirectRemainingSeats=4, JDirectAirlines="SQ",
+        )
+        result = self.run_with([record])
+        row = result.options[0]
+        self.assertEqual((row.mileage_cost, row.remaining_seats, row.airlines), (60000, 2, ["SQ", "LH"]))
+
+    def test_party_size_is_judged_on_the_nonstop_seat_count(self):
+        # The cabin as a whole has one seat, but its nonstop space has four.
+        record = summary_only_availability(direct=True, JRemainingSeats=1, JDirectRemainingSeats=4)
+        self.assertEqual(len(self.run_with([record], direct_only=True, pax=2).options), 1)
+        self.assertEqual(self.run_with([record], pax=2).options, [])
+
+    def test_the_nonstop_filter_is_explained_in_the_notes(self):
+        result = self.run_with([summary_only_availability(direct=True)], direct_only=True)
+        self.assertTrue(any("Filtered to nonstop itineraries" in n for n in result.notes))
+
+
+# --------------------------------------------------------------------------- FlightPoints output captured live
+
+
+LIVE_FIXTURES = FIXTURES / "live"
+
+
+class LiveFlightPointsFormatTests(unittest.TestCase):
+    """Parsing checked against tool output captured from FlightPoints in September 2026.
+
+    The search capture is verbatim; the details capture keeps 4 of 48 itineraries and the
+    CDG-LAX capture keeps 2 of 15 results-table rows, so the files stay a readable size.
+    """
+
+    def test_live_search_output_parses_into_premium_entries(self):
+        entries = cc.parse_text((LIVE_FIXTURES / "search_jfk_ams_2026-10-15.txt").read_text(encoding="utf-8"))
+        premium = [e for e in entries if e.cabin in ("business", "first")]
+        self.assertEqual(len(premium), 12)
+        self.assertTrue(all(e.date == "2026-10-15" and e.route == "JFK-AMS" for e in premium))
+        aeroplan = next(e for e in premium if e.source == "aeroplan")
+        self.assertEqual((aeroplan.cabin, aeroplan.miles, aeroplan.taxes_usd), ("business", 58800, 141.0))
+        # A program FlightPoints lists that seats.aero does not track stays verbatim and simply never matches.
+        self.assertIn("miles&go", {e.source for e in entries})
+
+    def test_live_details_output_yields_flight_numbers_and_ignores_premium_economy(self):
+        entries = cc.parse_text((LIVE_FIXTURES / "details_ac_jfk_ams_2026-10-15.txt").read_text(encoding="utf-8"))
+        business = [e for e in entries if e.cabin == "business"]
+        self.assertEqual([e.flight_numbers for e in business], [("LO27", "LO267"), ("EK206", "LH257", "LH986")])
+        self.assertEqual([e.miles for e in business], [75000, 58800])
+        self.assertTrue(all(e.source == "aeroplan" for e in business))
+        self.assertNotIn("premium", {e.cabin for e in entries})   # "Prem. Eco." lines are out of scope
+
+    def test_live_empty_search_is_an_answer_not_an_unreadable_file(self):
+        text = (LIVE_FIXTURES / "search_eze_hkg_2027-05-14_empty.txt").read_text(encoding="utf-8")
+        self.assertEqual(cc.parse_text(text), [])
+        self.assertTrue(cc.is_empty_result(text))
+
+    def test_flightpoints_display_names_map_onto_seats_aero_programs(self):
+        seen_live = {
+            "AAdvantage": "american", "Aeroplan": "aeroplan", "Atmos Rewards": "alaska", "Flying Blue": "flyingblue",
+            "SkyMiles": "delta", "TrueBlue": "jetblue", "Etihad Guest": "etihad", "Miles & More": "lufthansa",
+            "Frequent Flyer": "qantas", "Privilege Club / Avios": "qatar", "MileagePlus": "united",
+            "Miles&Smiles": "turkish", "Aeromexico Rewards": "aeromexico", "Smiles": "smiles",
+            "Flying Club": "virginatlantic", "Velocity Frequent Flyer": "velocity",
+        }
+        for label, source in seen_live.items():
+            with self.subTest(label=label):
+                self.assertEqual(cc.source_for_program(label), source)
+                self.assertIn(source, sa.PROGRAM_NAMES)
+
+    def test_velocity_rows_confirm_instead_of_reading_as_missing_from_seats_aero(self):
+        entry = cc.parse_text(
+            "Award Flight Search: SYD → LAX\nDate: 2026-11-14  |  Cabin: Business\n\n"
+            "Premium cabins (points):\n- Velocity Frequent Flyer: Biz 95,000+$289\n"
+        )
+        self.assertEqual([e.source for e in entry], ["velocity"])
+        option = sa.AwardOption(
+            program="Virgin Australia Velocity", source="velocity", cabin="business", travel_date="2026-11-14",
+            route="SYD-LAX", airlines=["VA"], flight_numbers="see program site", departs_at="", arrives_at="",
+            duration_minutes=0, stops=0, remaining_seats=2, mileage_cost=95000, taxes_minor_units=0,
+            taxes_currency="AUD", booking_link="",
+        )
+        summary = cc.match_options([option], entry)
+        self.assertEqual((summary.program_matches, summary.unmatched), (1, []))
+        self.assertEqual(option.confirmation, "program")
+
+
+# --------------------------------------------------------------------------- batch matrix
+
+
+class BatchMatrixTests(unittest.TestCase):
+    """A small slice of tests/batch_matrix.py, so the batch harness itself stays working.
+
+    The full sweep (10 routes x 10 months) is run from the command line:
+        python3 tests/batch_matrix.py --routes 10 --months 10 --pax 2
+    """
+
+    def test_small_matrix_passes_every_invariant(self):
+        import batch_matrix
+
+        with tempfile.TemporaryDirectory() as tmp:
+            failures, coverage = batch_matrix.run_matrix(
+                routes=2, months=2, pax=2, seed="unit-test", workdir=Path(tmp) / "reports")
+        self.assertEqual(failures, [])
+        self.assertEqual(coverage["scenarios"], 4)
+        self.assertGreater(coverage["options"], 0)
+
+
+# --------------------------------------------------------------------------- review follow-ups
+
+
+class UnknownFieldTests(unittest.TestCase):
+    """seats.aero omits fields on some records; absent must never be read as a convenient default."""
+
+    def trip(self, **overrides) -> dict:
+        base = {
+            "ID": "trip-x", "Cabin": "business", "MileageCost": 60000, "TotalTaxes": 1000,
+            "TaxesCurrency": "USD", "RemainingSeats": 2, "Carriers": "LH, LH",
+            "FlightNumbers": "LH405, LH996", "DepartsAt": "2026-11-14T10:00:00Z",
+            "ArrivesAt": "2026-11-14T18:00:00Z", "TotalDuration": 480,
+            "AvailabilitySegments": [{"Order": 0}, {"Order": 1}],
+        }
+        base.update(overrides)
+        return base
+
+    def availability(self) -> dict:
+        return {"ID": "avail-1", "Date": "2026-11-14", "Source": "aeroplan", "JAvailable": True,
+                "Route": {"OriginAirport": "SIN", "DestinationAirport": "LHR"}, "UpdatedAt": "2026-11-13T00:00:00Z"}
+
+    def test_a_trip_without_a_stops_field_is_unknown_not_nonstop(self):
+        options = sa._trip_options(self.availability(), {"data": [self.trip()]}, query())
+        self.assertEqual([o.stops for o in options], [1])            # two segments means one stop
+        self.assertEqual(sa.format_stops(options[0].stops), "1 stop")
+
+    def test_a_trip_with_neither_stops_nor_segments_reports_an_unknown_stop_count(self):
+        trip = self.trip(AvailabilitySegments=[], FlightNumbers="")
+        options = sa._trip_options(self.availability(), {"data": [trip]}, query())
+        self.assertEqual([o.stops for o in options], [-1])
+        self.assertEqual(sa.format_stops(options[0].stops), "?")
+
+    def test_a_connecting_trip_without_a_stops_field_is_dropped_by_direct_only(self):
+        options = sa._trip_options(self.availability(), {"data": [self.trip()]}, query(direct_only=True))
+        self.assertEqual(options, [])
+
+    def test_a_nonstop_trip_without_a_stops_field_survives_direct_only(self):
+        trip = self.trip(AvailabilitySegments=[{"Order": 0}], FlightNumbers="SQ308", Carriers="SQ")
+        options = sa._trip_options(self.availability(), {"data": [trip]}, query(direct_only=True))
+        self.assertEqual([o.stops for o in options], [0])
+
+    def test_an_unreadable_timestamp_is_infinitely_old_not_brand_new(self):
+        self.assertEqual(sa._hours_since(""), float("inf"))
+        self.assertEqual(sa._hours_since("not a date"), float("inf"))
+        self.assertEqual(sa.format_age("not a date"), "unknown")
+
+    def test_records_of_unknown_age_are_the_first_ones_refreshed(self):
+        records = [
+            dict(self.availability(), ID="fresh", UpdatedAt=sa._iso_now() if hasattr(sa, "_iso_now") else "2026-11-13T00:00:00Z"),
+            dict(self.availability(), ID="ageless", UpdatedAt=""),
+        ]
+        routes = {"search": {"data": records, "hasMore": False, "cursor": 0},
+                  "refresh": lambda: refresh_response({"ageless": "succeeded", "fresh": "succeeded"}, complete=True),
+                  "trips/fresh": {"data": []}, "trips/ageless": {"data": []}}
+        client, opener, _ = make_client(routes)
+        sa.run_search(client, query(refresh=True, refresh_older_than_hours=1.0))
+        posted = json.loads([r for r in opener.bodies if "availability_ids" in r][0])["availability_ids"]
+        self.assertEqual(posted[0], "ageless", "a record with no usable timestamp must be refreshed first")
+
+    def test_a_record_without_an_id_cannot_be_refreshed_and_does_not_crash(self):
+        records = [{k: v for k, v in self.availability().items() if k != "ID"}]
+        routes = {"search": {"data": records, "hasMore": False, "cursor": 0}}
+        client, opener, _ = make_client(routes)
+        result = sa.run_search(client, query(refresh=True))
+        self.assertFalse(any("refresh" in url for url in opener.requests))
+        self.assertEqual(result.premium_matches, 1)
+
+    def test_a_published_zero_seat_count_on_nonstop_space_is_not_overwritten(self):
+        record = summary_only_availability(direct=True, JRemainingSeats=4, JDirectRemainingSeats=0)
+        client, _, _ = make_client({"search": {"data": [record], "hasMore": False, "cursor": 0}})
+        result = sa.run_search(client, query(max_trip_lookups=0, direct_only=True, pax=4))
+        self.assertEqual([o.remaining_seats for o in result.options], [0])   # "not published", not four
+        self.assertTrue(any("does not publish a seat count" in n for n in result.notes))
+
+
+class QuotaAccountingTests(unittest.TestCase):
+    def test_a_refresh_costs_one_call_per_record(self):
+        client, _, _ = make_client({"refresh": lambda: refresh_response({"a": "succeeded", "b": "succeeded", "c": "succeeded"}, complete=True)})
+        client.refresh_and_wait(["a", "b", "c"])
+        self.assertEqual(client.calls_made, 3)
+
+    def test_the_report_footer_shows_the_quota_seats_aero_reported(self):
+        result = sa.SearchResult(query=query(), options=[], notes=[], api_calls=4, availabilities_seen=0,
+                                 generated_at="2026-09-13T00:00:00+00:00",
+                                 refresh=sa.RefreshOutcome(requested=2, quota={"limit": 1000, "remaining": 880}))
+        self.assertIn("daily quota 880/1000 left", sa.render_html(result))
+
+    def test_the_footer_stays_quiet_when_no_quota_was_reported(self):
+        result = sa.SearchResult(query=query(), options=[], notes=[], api_calls=4, availabilities_seen=0,
+                                 generated_at="2026-09-13T00:00:00+00:00")
+        self.assertNotIn("daily quota", sa.render_html(result))
+
+
+class FlexWindowTests(unittest.TestCase):
+    def test_flex_never_reaches_back_before_today(self):
+        today = date(2026, 9, 13)
+        q, _ = sa.parse_args(["SIN", "LHR", "--date", "2026-09-13", "--flex", "3"], today=today)
+        self.assertEqual((q.start_date, q.end_date), (today, date(2026, 9, 16)))
+
+    def test_flex_is_symmetric_when_the_whole_window_is_ahead(self):
+        q, _ = sa.parse_args(["SIN", "LHR", "--date", "2026-10-13", "--flex", "3"], today=date(2026, 9, 13))
+        self.assertEqual((q.start_date, q.end_date), (date(2026, 10, 10), date(2026, 10, 16)))
+
+
+class CrossCheckAccountingTests(unittest.TestCase):
+    def entry(self, **kw):
+        base = dict(date="2026-10-15", origin="JFK", destination="AMS", cabin="business", source="united",
+                    miles=110000, flight_numbers=("LO27", "LO267"), program_label="MileagePlus")
+        base.update(kw)
+        return cc.CrossCheckEntry(**base)
+
+    def option(self, **kw):
+        base = dict(program="Air Canada Aeroplan", source="aeroplan", cabin="business", travel_date="2026-10-15",
+                    route="JFK-AMS", airlines=["LO"], flight_numbers="LO27, LO267", departs_at="", arrives_at="",
+                    duration_minutes=0, stops=1, remaining_seats=2, mileage_cost=75000, taxes_minor_units=0,
+                    taxes_currency="USD", booking_link="")
+        base.update(kw)
+        return sa.AwardOption(**base)
+
+    def test_a_match_through_another_program_is_not_also_reported_as_missing(self):
+        option = self.option()
+        summary = cc.match_options([option], [self.entry()])
+        self.assertEqual(summary.flight_matches, 1)
+        self.assertEqual(option.confirmation, "flight")
+        self.assertIn("seen on FlightPoints via MileagePlus", option.crosscheck_note)
+        self.assertEqual(summary.unmatched, [], "the entry that confirmed the row is not also missing from seats.aero")
+
+    def test_a_genuinely_extra_flightpoints_option_is_still_reported(self):
+        extra = self.entry(source="delta", miles=99000, flight_numbers=("DL40",), program_label="SkyMiles")
+        summary = cc.match_options([self.option()], [self.entry(), extra])
+        self.assertEqual(len(summary.unmatched), 1)
+        self.assertIn("SkyMiles", summary.unmatched[0])
+
+
+class EmptyFlightPointsResultTests(unittest.TestCase):
+    """"FlightPoints found no premium space" must not read as "the file was unreadable"."""
+
+    def files(self, **named: str) -> Path:
+        tmp = Path(tempfile.mkdtemp())
+        for name, text in named.items():
+            (tmp / f"{name}.txt").write_text(text, encoding="utf-8")
+        return tmp
+
+    def test_a_search_with_results_but_no_premium_section_counts_as_an_answer(self):
+        text = ("Award Flight Search: SIN → HKG\nDate: 2026-11-06  |  Cabin: Business  |  Passengers: 2\n\n"
+                "Search complete. Found 14 award flight option(s).\n\n"
+                "| # | Program | Airline | Economy | Seats | Stops | Book |\n"
+                "| 1 | [AAdvantage](https://x) | American Airlines | 35,000 + $6 | 1 | Direct | [Book](https://x) |\n")
+        entries, files, empty, _skipped = cc.load_files([self.files(economy_only=text)])
+        self.assertEqual((len(entries), files, empty), (0, 1, 1))
+        self.assertTrue(cc.CrossCheckSummary(entries=0, files=1, empty_files=1).answered)
+
+    def test_a_details_result_with_no_business_or_first_line_counts_as_an_answer(self):
+        # Premium economy is out of scope, so this file says "nothing for you here", not "unreadable".
+        text = ("Found 2 detailed flight option(s).\n\n"
+                "1. [AC](https://x): SIN → HKG\n   Departs: 2026-11-06 10:00:00\n"
+                "   Prem. Eco.: 85,000 pts + 22.00 taxes  |  2 seat(s)\n")
+        entries, files, empty, _skipped = cc.load_files([self.files(economy_details=text)])
+        self.assertEqual((len(entries), files, empty), (0, 1, 1))
+
+    def test_a_changed_premium_block_still_reads_as_unreadable(self):
+        # The section is there but nothing parses: that is a format change, not "no space".
+        text = ("Award Flight Search: SIN → HKG\nDate: 2026-11-06  |  Cabin: Business\n\n"
+                "Premium cabins (points):\n- Aeroplan -- business class for 52500 points\n")
+        entries, files, empty, _skipped = cc.load_files([self.files(new_format=text)])
+        self.assertEqual((len(entries), files, empty), (0, 1, 0))
+        self.assertFalse(cc.CrossCheckSummary(entries=0, files=1, empty_files=0).answered)
+
+
+class SortScriptBehaviourTests(unittest.TestCase):
+    """Run the dashboard's own sorter against a stub DOM, so the comparator is tested, not just its text."""
+
+    HARNESS = """
+    function cell(key) { return { hasAttribute: function () { return key !== null; },
+                                  getAttribute: function () { return key; } }; }
+    function row(keys) { return { cells: keys.map(cell) }; }
+    var ROWS = INPUT_ROWS.map(row);
+    var order = [];
+    var body = { rows: ROWS, appendChild: function (r) { order.push(ROWS.indexOf(r)); } };
+    var heads = [{ hasAttribute: function () { return true; }, getAttribute: function () { return '0'; },
+                   setAttribute: function () {}, classList: { toggle: function () {} },
+                   querySelector: function () { return null; }, addEventListener: function () {} }];
+    var document = { getElementById: function () { return { tBodies: [body], tHead: { rows: [{ cells: heads }] } }; } };
+    var location = { hash: '' };
+    SCRIPT
+    heads[0].addEventListener = null;
+    console.log(JSON.stringify(order));
+    """
+
+    def order_after_sorting(self, keys: list[str]) -> list[int]:
+        script = sa.SORT_SCRIPT.replace("})();", "sortBy(0, 'ascending');\n})();")
+        harness = self.HARNESS.replace("SCRIPT", script).replace("INPUT_ROWS", json.dumps([[k] for k in keys]))
+        out = subprocess.run([shutil.which("node"), "-e", harness], capture_output=True, text=True, timeout=30)
+        self.assertEqual(out.returncode, 0, out.stderr)
+        return json.loads(out.stdout.strip().splitlines()[-1])
+
+    @unittest.skipUnless(shutil.which("node"), "node is not installed")
+    def test_a_date_column_really_reorders(self):
+        # parseFloat("2026-11-20") is 2026 for every row, which used to leave the order untouched.
+        self.assertEqual(self.order_after_sorting(["2026-11-20", "2026-11-03", "2026-11-11"]), [1, 2, 0])
+
+    @unittest.skipUnless(shutil.which("node"), "node is not installed")
+    def test_numeric_columns_still_sort_numerically(self):
+        self.assertEqual(self.order_after_sorting(["108400", "87500", "162800"]), [1, 0, 2])
+
+    @unittest.skipUnless(shutil.which("node"), "node is not installed")
+    def test_codes_that_start_with_digits_sort_as_text(self):
+        self.assertEqual(self.order_after_sorting(["3u", "aa", "1x"]), [2, 0, 1])
+
+    @unittest.skipUnless(shutil.which("node"), "node is not installed")
+    def test_unknown_values_still_sort_last(self):
+        self.assertEqual(self.order_after_sorting(["500", "", "100"]), [2, 0, 1])
+
+
+# --------------------------------------------------------------------------- preflight
+
+
+def git(args: list[str], root: Path) -> subprocess.CompletedProcess:
+    env = {**os.environ, "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@e", "GIT_COMMITTER_NAME": "t",
+           "GIT_COMMITTER_EMAIL": "t@e", "GIT_CONFIG_GLOBAL": "/dev/null", "GIT_CONFIG_SYSTEM": "/dev/null"}
+    return subprocess.run(["git", "-C", str(root), *args], capture_output=True, text=True, env=env, check=False)
+
+
+def make_checkout(tmp: Path) -> tuple[Path, Path]:
+    """An origin repository with one commit, and a clone of it that tracks its branch."""
+    origin, clone = tmp / "origin", tmp / "clone"
+    origin.mkdir()
+    git(["init", "--quiet", "-b", "main", "."], origin)
+    (origin / "SKILL.md").write_text("v1\n")
+    git(["add", "-A"], origin)
+    git(["commit", "--quiet", "-m", "first"], origin)
+    subprocess.run(["git", "clone", "--quiet", str(origin), str(clone)], check=True, capture_output=True)
+    return origin, clone
+
+
+def publish(origin: Path, text: str) -> None:
+    (origin / "SKILL.md").write_text(text)
+    git(["add", "-A"], origin)
+    git(["commit", "--quiet", "-m", "newer"], origin)
+
+
+@unittest.skipUnless(shutil.which("git"), "git is not installed")
+class PreflightUpdateTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+        self.origin, self.clone = make_checkout(self.tmp)
+
+    def run_update(self, root: Path | None = None) -> pf.Report:
+        report = pf.Report()
+        pf.update_skill(root or self.clone, report)
+        return report
+
+    def step(self, report: pf.Report) -> dict:
+        return next(s for s in report.steps if s["step"] == "update")
+
+    def test_a_newer_version_is_pulled_in(self):
+        publish(self.origin, "v2\n")
+        step = self.step(self.run_update())
+        self.assertEqual(step["status"], "updated")
+        self.assertEqual(step["commits"], 1)
+        self.assertEqual((self.clone / "SKILL.md").read_text(), "v2\n")
+
+    def test_an_up_to_date_checkout_is_left_alone(self):
+        self.assertEqual(self.step(self.run_update())["status"], "ok")
+        self.assertEqual((self.clone / "SKILL.md").read_text(), "v1\n")
+
+    def test_uncommitted_work_is_never_overwritten(self):
+        publish(self.origin, "v2\n")
+        (self.clone / "SKILL.md").write_text("mine\n")
+        step = self.step(self.run_update())
+        self.assertEqual(step["status"], "warning")
+        self.assertIn("uncommitted changes", step["detail"])
+        self.assertEqual((self.clone / "SKILL.md").read_text(), "mine\n")
+
+    def test_local_commits_are_never_discarded(self):
+        publish(self.origin, "v2\n")
+        (self.clone / "local.md").write_text("local work\n")
+        git(["add", "-A"], self.clone)
+        git(["commit", "--quiet", "-m", "local"], self.clone)
+        head = git(["rev-parse", "HEAD"], self.clone).stdout
+        step = self.step(self.run_update())
+        self.assertEqual(step["status"], "warning")
+        self.assertIn("its own", step["detail"])
+        self.assertEqual(git(["rev-parse", "HEAD"], self.clone).stdout, head)
+
+    def test_an_unreachable_remote_is_a_warning_not_a_failure(self):
+        publish(self.origin, "v2\n")
+        git(["remote", "set-url", "origin", str(self.tmp / "gone")], self.clone)
+        report = self.run_update()
+        self.assertEqual(self.step(report)["status"], "warning")
+        self.assertEqual(report.exit_code, 0, "a failed update must never stop a search")
+
+    def test_a_plain_directory_is_not_treated_as_a_checkout(self):
+        plain = self.tmp / "plain"
+        plain.mkdir()
+        self.assertEqual(self.step(self.run_update(plain))["status"], "skipped")
+
+    def test_offline_does_not_touch_the_network(self):
+        publish(self.origin, "v2\n")
+        report = pf.Report()
+        pf.update_skill(self.clone, report, offline=True)
+        self.assertEqual(self.step(report)["status"], "skipped")
+        self.assertEqual((self.clone / "SKILL.md").read_text(), "v1\n")
+
+
+class PreflightFlushTests(unittest.TestCase):
+    def setUp(self):
+        self.dir = Path(tempfile.mkdtemp()) / "award-reports"
+        (self.dir / "crosscheck").mkdir(parents=True)
+
+    def write(self, name: str, age_hours: float) -> Path:
+        path = self.dir / name
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("x" * 100)
+        stamp = time.time() - age_hours * 3600
+        os.utime(path, (stamp, stamp))
+        return path
+
+    def flush(self, **kw) -> pf.Report:
+        report = pf.Report()
+        pf.flush_stale_data(self.dir, report, kw.get("max_age_hours", pf.DEFAULT_MAX_AGE_HOURS),
+                            kw.get("crosscheck_max_age_minutes", pf.DEFAULT_CROSSCHECK_MAX_AGE_MINUTES),
+                            kw.get("flush_all", False))
+        return report
+
+    def test_stale_reports_and_runs_go_and_fresh_ones_stay(self):
+        old_html, old_json = self.write("awards_SIN-LHR_2026-11-14_pax2.html", 30), self.write("run.json", 30)
+        fresh = self.write("awards_SIN-HND_2026-12-01_pax2.html", 1)
+        self.flush()
+        self.assertFalse(old_html.exists())
+        self.assertFalse(old_json.exists())
+        self.assertTrue(fresh.exists(), "a report from an hour ago is still this session's work")
+
+    def test_cross_check_dumps_expire_within_the_hour(self):
+        stale = self.write("crosscheck/search-SIN-HND.txt", 2)
+        fresh = self.write("crosscheck/search-JFK-AMS.txt", 0.2)
+        self.flush()
+        self.assertFalse(stale.exists(), "an old cross-check file describes another search")
+        self.assertTrue(fresh.exists())
+
+    def test_flush_all_clears_everything_whatever_its_age(self):
+        paths = [self.write("awards_a_2026-11-14_pax2.html", 0.1), self.write("crosscheck/x.txt", 0.1)]
+        self.flush(flush_all=True)
+        self.assertEqual([p for p in paths if p.exists()], [])
+
+    def test_nothing_outside_the_report_directory_is_touched(self):
+        outside = self.dir.parent / "awards_keepme.html"
+        outside.write_text("not ours")
+        os.utime(outside, (0, 0))
+        nested = self.dir / "archive"
+        nested.mkdir()
+        buried = self.write("archive/awards_old.html", 99)
+        self.flush()
+        self.assertTrue(outside.exists(), "only the report directory is ever cleared")
+        self.assertTrue(buried.exists(), "flush does not recurse into other directories")
+
+    def test_a_missing_report_directory_is_fine(self):
+        report = pf.Report()
+        pf.flush_stale_data(self.dir.parent / "never-made", report, 12, 60)
+        self.assertEqual(report.steps[0]["status"], "ok")
+        self.assertEqual(report.exit_code, 0)
+
+    def test_the_summary_counts_what_it_removed(self):
+        for n in range(3):
+            self.write(f"awards_r{n}_2026-11-14_pax2.html", 40)
+        report = self.flush()
+        self.assertEqual(report.steps[0]["removed"], 3)
+        self.assertIn("cleared 3 stale file(s)", report.steps[0]["detail"])
+
+
+class PreflightCheckTests(unittest.TestCase):
+    def client_factory(self, opener: FakeOpener, **overrides):
+        """Hand preflight a client wired to a fake opener, without the patched name recursing.
+
+        Whatever preflight passes (timeout, max_retries) is forwarded, so the tests exercise the
+        real call; `overrides` only wins where a test deliberately sets something else.
+        """
+        real = sa.SeatsAeroClient
+        def build(key, **kw):
+            return real(key, opener=opener, sleep=lambda _seconds: None, **{**kw, **overrides})
+        return build
+
+    def key_file(self, value: str = "test-key") -> Path:
+        path = Path(tempfile.mkdtemp()) / "api_key"
+        path.write_text(value)
+        path.chmod(0o600)
+        return path
+
+    def test_a_missing_key_blocks_the_search_with_exit_2(self):
+        report = pf.Report()
+        with mock.patch.dict(os.environ, {"SEATS_AERO_API_KEY": "", "SEATS_API_KEY": ""}, clear=False), \
+             mock.patch.object(sa, "API_KEY_FILE", Path("/nonexistent/api_key")):
+            pf.check_api_key(report)
+        self.assertEqual(report.exit_code, 2)
+        self.assertIn("No seats.aero API key", report.blocked)
+
+    def test_a_key_the_api_rejects_blocks_the_search_with_exit_3(self):
+        report = pf.Report()
+        opener = FakeOpener({"search": http_error("https://seats.aero/partnerapi/search", 403, "forbidden")})
+        with mock.patch.object(sa, "SeatsAeroClient", self.client_factory(opener)):
+            pf.check_seats_aero("stale-key", report)
+        self.assertEqual(report.exit_code, 3)
+        self.assertIn("rejected the API key", report.blocked)
+
+    def test_an_unreachable_api_blocks_the_search_with_exit_3(self):
+        report = pf.Report()
+        opener = FakeOpener({"search": urllib.error.URLError("no route to host")})
+        with mock.patch.object(sa, "SeatsAeroClient", self.client_factory(opener, max_retries=0)):
+            pf.check_seats_aero("test-key", report)
+        self.assertEqual(report.exit_code, 3)
+        self.assertIn("could not reach seats.aero", report.blocked)
+
+    def test_a_working_key_costs_exactly_one_call(self):
+        report = pf.Report()
+        opener = FakeOpener({"search": {"data": [], "hasMore": False, "cursor": 0}})
+        build, clients = self.client_factory(opener), []
+        def factory(key, **kw):
+            clients.append(build(key, **kw))
+            return clients[-1]
+        with mock.patch.object(sa, "SeatsAeroClient", factory):
+            pf.check_seats_aero("test-key", report)
+        self.assertEqual(report.exit_code, 0)
+        self.assertEqual(clients[0].calls_made, 1)
+        self.assertEqual(len(opener.requests), 1)
+        self.assertIn("take=1", opener.requests[0])
+
+    def test_python_older_than_the_floor_is_refused(self):
+        report = pf.Report()
+        with mock.patch.object(sys, "version_info", (3, 8, 0, "final", 0)):
+            pf.check_python(report)
+        self.assertEqual(report.exit_code, 2)
+        self.assertIn("too old", report.blocked)
+
+    def test_connector_and_freshness_reminders_are_always_present(self):
+        report = pf.Report()
+        pf.note_checks_this_script_cannot_make(report)
+        details = " ".join(s["detail"] for s in report.steps)
+        self.assertIn("FlightPoints", details)
+        self.assertIn("--no-refresh", details)
+
+    def test_the_reminders_are_notes_not_checks_that_passed(self):
+        report = pf.Report()
+        pf.note_checks_this_script_cannot_make(report)
+        self.assertEqual({s["status"] for s in report.steps}, {"note"},
+                         "nothing was verified here, so these must not read as passing checks")
+
+
+class PreflightCommandTests(unittest.TestCase):
+    def test_offline_run_reports_ready_without_touching_the_network(self):
+        out = io.StringIO()
+        key = Path(tempfile.mkdtemp()) / "api_key"
+        key.write_text("test-key")
+        key.chmod(0o600)
+        with mock.patch.object(sa, "API_KEY_FILE", key), mock.patch.dict(os.environ, {"SEATS_AERO_API_KEY": ""}, clear=False), \
+             contextlib.redirect_stdout(out):
+            code = pf.main(["--offline", "--no-flush", "--json"])
+        payload = json.loads(out.getvalue())
+        self.assertEqual(code, 0)
+        self.assertTrue(payload["ready"])
+        self.assertFalse(payload["verified"], "--offline never put the key to seats.aero")
+        self.assertEqual({s["step"] for s in payload["steps"]},
+                         {"update", "flush", "python", "api key", "seats.aero", "connectors", "freshness"})
+
+    def test_an_offline_run_says_the_key_was_never_checked(self):
+        out = io.StringIO()
+        key = Path(tempfile.mkdtemp()) / "api_key"
+        key.write_text("test-key")
+        key.chmod(0o600)
+        with mock.patch.object(sa, "API_KEY_FILE", key), mock.patch.dict(os.environ, {"SEATS_AERO_API_KEY": ""}, clear=False), \
+             contextlib.redirect_stdout(out):
+            code = pf.main(["--offline", "--no-flush"])
+        self.assertEqual(code, 0)
+        self.assertIn("never checked against seats.aero", out.getvalue())
+
+    def test_a_blocked_run_says_so_and_exits_nonzero(self):
+        out = io.StringIO()
+        with mock.patch.dict(os.environ, {"SEATS_AERO_API_KEY": "", "SEATS_API_KEY": ""}, clear=False), \
+             mock.patch.object(sa, "API_KEY_FILE", Path("/nonexistent/api_key")), contextlib.redirect_stdout(out):
+            code = pf.main(["--offline", "--no-flush"])
+        self.assertEqual(code, 2)
+        self.assertIn("cannot search:", out.getvalue())
+
+
+class PreflightSafetyTests(unittest.TestCase):
+    """Every case a review found in the preflight; each one stays fixed."""
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+
+    @unittest.skipUnless(shutil.which("git"), "git is not installed")
+    def test_a_skill_vendored_in_another_repo_never_updates_that_repo(self):
+        project = self.tmp / "project"
+        (project / ".claude" / "skills" / "rss").mkdir(parents=True)
+        git(["init", "--quiet", "-b", "main", "."], project)
+        (project / "app.py").write_text("the user's own code\n")
+        git(["add", "-A"], project)
+        git(["commit", "--quiet", "-m", "project"], project)
+        head = git(["rev-parse", "HEAD"], project).stdout
+
+        report = pf.Report()
+        pf.update_skill(project / ".claude" / "skills" / "rss", report)
+        step = next(s for s in report.steps if s["step"] == "update")
+        self.assertEqual(step["status"], "skipped")
+        self.assertIn("not its own", step["detail"])
+        self.assertEqual(git(["rev-parse", "HEAD"], project).stdout, head, "the host repository must not move")
+        self.assertEqual((project / "app.py").read_text(), "the user's own code\n")
+
+    def test_a_machine_without_git_reports_a_skipped_update_not_a_traceback(self):
+        report = pf.Report()
+        with mock.patch.object(pf.subprocess, "run", side_effect=FileNotFoundError("git")):
+            pf.update_skill(self.tmp, report)
+        step = next(s for s in report.steps if s["step"] == "update")
+        self.assertEqual(step["status"], "skipped")
+        self.assertIn("git is not installed", step["detail"])
+        self.assertEqual(report.exit_code, 0)
+
+    def test_rate_limiting_is_a_warning_because_the_key_is_still_good(self):
+        report = pf.Report()
+        opener = FakeOpener({"search": http_error("https://seats.aero/partnerapi/search", 429, "slow down", {"Retry-After": "3600"})})
+        real = sa.SeatsAeroClient
+        sleeps = []
+        with mock.patch.object(sa, "SeatsAeroClient", lambda key, **kw: real(key, opener=opener, sleep=sleeps.append, **kw)):
+            pf.check_seats_aero("test-key", report)
+        step = next(s for s in report.steps if s["step"] == "seats.aero")
+        self.assertEqual(step["status"], "warning")
+        self.assertEqual(report.exit_code, 0, "a busy API is not an invalid key")
+        self.assertEqual(sleeps, [], "the preflight must not wait out a Retry-After of an hour")
+        self.assertEqual(len(opener.requests), 1)
+
+    def test_a_server_error_is_a_warning_too(self):
+        report = pf.Report()
+        opener = FakeOpener({"search": http_error("https://seats.aero/partnerapi/search", 503, "maintenance")})
+        real = sa.SeatsAeroClient
+        with mock.patch.object(sa, "SeatsAeroClient", lambda key, **kw: real(key, opener=opener, sleep=lambda _s: None, **kw)):
+            pf.check_seats_aero("test-key", report)
+        self.assertEqual(next(s for s in report.steps if s["step"] == "seats.aero")["status"], "warning")
+        self.assertEqual(report.exit_code, 0)
+
+    def test_an_unreadable_response_blocks_rather_than_crashing(self):
+        report = pf.Report()
+        class Garbage(FakeResponse):
+            def read(self):
+                return b"<html>not json</html>"
+        real = sa.SeatsAeroClient
+        with mock.patch.object(sa, "SeatsAeroClient",
+                               lambda key, **kw: real(key, opener=lambda req, timeout: Garbage(b""), sleep=lambda _s: None, **kw)):
+            pf.check_seats_aero("test-key", report)
+        self.assertEqual(report.exit_code, 3)
+        self.assertIn("could not read", report.blocked)
+
+    def test_only_the_files_this_skill_writes_are_deleted(self):
+        reports = self.tmp / "award-reports"
+        reports.mkdir()
+        keep = reports / "my-notes.json"           # someone else's file parked in the same folder
+        keep.write_text("{}")
+        os.utime(keep, (0, 0))
+        ours = reports / "awards_SIN-LHR_2026-11-14_pax2.html"
+        ours.write_text("<html></html>")
+        os.utime(ours, (0, 0))
+        run_dump = reports / "run.json"
+        run_dump.write_text("{}")
+        os.utime(run_dump, (0, 0))
+
+        report = pf.Report()
+        pf.flush_stale_data(reports, report, 12, 60, flush_all=True)
+        self.assertTrue(keep.exists(), "an unrelated JSON file is not this skill's to delete")
+        self.assertFalse(ours.exists())
+        self.assertFalse(run_dump.exists())
+
+    def test_the_flush_line_names_the_directory_it_cleared(self):
+        reports = self.tmp / "award-reports"
+        reports.mkdir()
+        stale = reports / "awards_a_2026-11-14_pax2.html"
+        stale.write_text("x")
+        os.utime(stale, (0, 0))
+        report = pf.Report()
+        pf.flush_stale_data(reports, report, 12, 60)
+        self.assertEqual(report.steps[0]["directory"], str(reports.resolve()))
+        self.assertIn(str(reports.resolve()), report.steps[0]["detail"])
+
+    def test_a_symlinked_crosscheck_directory_is_left_alone(self):
+        reports = self.tmp / "award-reports"
+        reports.mkdir()
+        elsewhere = self.tmp / "documents"
+        elsewhere.mkdir()
+        theirs = elsewhere / "taxes.txt"           # nothing to do with this skill
+        theirs.write_text("keep me")
+        os.utime(theirs, (0, 0))
+        (reports / pf.CROSSCHECK_DIR).symlink_to(elsewhere, target_is_directory=True)
+
+        report = pf.Report()
+        pf.flush_stale_data(reports, report, 12, 60, flush_all=True)
+        self.assertTrue(theirs.exists(), "a symlinked crosscheck folder must not widen the blast radius")
+        self.assertEqual(report.exit_code, 0)
+
+    def test_the_crosscheck_flush_only_takes_the_dumps_this_skill_writes(self):
+        crosscheck = self.tmp / "award-reports" / pf.CROSSCHECK_DIR
+        crosscheck.mkdir(parents=True)
+        theirs = crosscheck / "my-personal-notes.md"
+        theirs.write_text("keep me")
+        os.utime(theirs, (0, 0))
+        ours = crosscheck / "search-SIN-HND-business.txt"
+        ours.write_text("FlightPoints output")
+        os.utime(ours, (0, 0))
+
+        report = pf.Report()
+        pf.flush_stale_data(self.tmp / "award-reports", report, 12, 60)
+        self.assertTrue(theirs.exists(), "only .txt dumps in this folder are this skill's")
+        self.assertFalse(ours.exists())
+
+    def test_a_file_that_cannot_be_deleted_is_the_users_to_fix_not_a_dead_api(self):
+        out = io.StringIO()
+        with mock.patch.object(pf, "flush_stale_data", side_effect=PermissionError("[Errno 13] Permission denied")), \
+             contextlib.redirect_stdout(out):
+            code = pf.main(["--offline", "--json"])
+        payload = json.loads(out.getvalue())     # must stay parseable: --json promises JSON
+        self.assertEqual(code, 2, "exit 3 would tell the user their key expired")
+        self.assertFalse(payload["ready"])
+        self.assertIn("Permission denied", payload["blocked"])
+
+    @unittest.skipUnless(shutil.which("git"), "git is not installed")
+    def test_a_hanging_fetch_is_a_warning_not_a_dead_search(self):
+        """A blackholed network makes fetch hang rather than fail; the search must still go ahead."""
+        _origin, clone = make_checkout(self.tmp)
+        report = pf.Report()
+        real = pf.subprocess.run
+
+        def hang(cmd, *args, **kw):
+            if "fetch" in cmd:
+                raise subprocess.TimeoutExpired(cmd, pf.GIT_TIMEOUT_SECONDS)
+            return real(cmd, *args, **kw)
+
+        with mock.patch.object(pf.subprocess, "run", side_effect=hang):
+            pf.update_skill(clone, report)
+        step = next(s for s in report.steps if s["step"] == "update")
+        self.assertEqual(step["status"], "warning")
+        self.assertIn("did not answer", step["detail"])
+        self.assertEqual(report.exit_code, 0, "a failed update must never stop a search")
+
+    def test_git_is_never_allowed_to_prompt(self):
+        seen = {}
+
+        def record(cmd, *args, **kw):
+            seen.update(kw)
+            return subprocess.CompletedProcess(cmd, 0, "", "")
+
+        with mock.patch.object(pf.subprocess, "run", side_effect=record):
+            pf.git(["status"], self.tmp)
+        self.assertEqual(seen["env"]["GIT_TERMINAL_PROMPT"], "0")
+        self.assertEqual(seen["stdin"], subprocess.DEVNULL, "an unattended run must not wait on a password")
+
+    @unittest.skipUnless(shutil.which("git"), "git is not installed")
+    def test_a_status_that_fails_is_not_read_as_a_clean_tree(self):
+        origin, clone = make_checkout(self.tmp)
+        publish(origin, "v2\n")
+        real = pf.git
+
+        def fail_status(args, root):
+            if args[0] == "status":
+                return subprocess.CompletedProcess(args, 128, "", "fatal: unable to read index.lock")
+            return real(args, root)
+
+        report = pf.Report()
+        with mock.patch.object(pf, "git", side_effect=fail_status):
+            pf.update_skill(clone, report)
+        step = next(s for s in report.steps if s["step"] == "update")
+        self.assertEqual(step["status"], "warning")
+        self.assertEqual((clone / "SKILL.md").read_text(), "v1\n", "an unknown tree state must not be merged over")
+
+    def test_unreadable_rev_list_output_warns_instead_of_raising(self):
+        self.assertIsNone(pf._two_counts("warning: refname is ambiguous\n0\t2\n"))
+        self.assertIsNone(pf._two_counts(""))
+        self.assertEqual(pf._two_counts("0\t2\n"), (0, 2))
+
+    def test_the_probe_asks_for_no_retries(self):
+        seen = {}
+        opener = FakeOpener({"search": {"data": [], "hasMore": False, "cursor": 0}})
+        real = sa.SeatsAeroClient
+
+        def factory(key, **kw):
+            seen.update(kw)
+            return real(key, opener=opener, sleep=lambda _s: None, **kw)
+
+        with mock.patch.object(sa, "SeatsAeroClient", factory):
+            pf.check_seats_aero("test-key", pf.Report())
+        self.assertEqual(seen["max_retries"], 0, "a preflight must answer now, not wait out a Retry-After")
+
+    def test_the_flush_and_the_cross_check_agree_on_what_a_dump_is(self):
+        """Anything a search reads out of crosscheck/ must be something a flush can clear.
+
+        A file on one side only is the bug: read-but-never-flushed lets yesterday's availability
+        confirm today's rows forever, and flushed-but-never-read deletes evidence in use.
+        """
+        crosscheck_dir = self.tmp / "award-reports" / pf.CROSSCHECK_DIR
+        crosscheck_dir.mkdir(parents=True)
+        outside = self.tmp / "elsewhere.txt"
+        outside.write_text("Premium cabins\n")
+        for name in ("search-SIN-HND.txt", "SEARCH-SIN-NRT.TXT", "notes.md", "dump.json", "plain"):
+            (crosscheck_dir / name).write_text("Premium cabins\n")
+        (crosscheck_dir / "linked.txt").symlink_to(outside)
+
+        flushed = {path.name for path in pf._expired(crosscheck_dir, crosscheck.is_dump, time.time(), 0, True)}
+        read = {path.name for path in sorted(crosscheck_dir.iterdir()) if crosscheck.is_dump(path)}
+        self.assertEqual(flushed, read, "a search must read exactly the set a flush can clear")
+        self.assertEqual(read, {"search-SIN-HND.txt", "SEARCH-SIN-NRT.TXT"},
+                         "a dump is a .txt in any case, and never a symlink out of the folder")
+
+    def test_files_a_cross_check_directory_skips_are_reported_not_swallowed(self):
+        crosscheck_dir = self.tmp / "crosscheck"
+        crosscheck_dir.mkdir()
+        (crosscheck_dir / "search-SIN-HND.md").write_text("Premium cabins\n")   # saved with the wrong extension
+        _entries, files, _empty, skipped = crosscheck.load_files([crosscheck_dir])
+        self.assertEqual((files, skipped), (0, 1))
+
+        result = sa.SearchResult(query=query(), options=[], notes=[], api_calls=0, availabilities_seen=0, generated_at="now")
+        sa.apply_cross_check(result, [crosscheck_dir])
+        self.assertIn("were not read", " ".join(result.notes), "a directory of unread files must say so")
+
+    def test_a_file_that_vanishes_mid_flush_is_a_warning_not_a_dead_search(self):
+        reports = self.tmp / "award-reports"
+        reports.mkdir()
+        stale = reports / "awards_SIN-LHR_2026-11-14_pax2.html"
+        stale.write_text("x")
+        os.utime(stale, (0, 0))
+        report = pf.Report()
+        with mock.patch.object(Path, "unlink", side_effect=FileNotFoundError("gone")):
+            pf.flush_stale_data(reports, report, 12, 60)
+        self.assertEqual(report.steps[0]["status"], "warning")
+        self.assertEqual(report.exit_code, 0, "another session tidying up must not block this search")
+
+    def test_a_broken_filesystem_keeps_the_steps_already_taken(self):
+        out = io.StringIO()
+        with mock.patch.object(pf, "check_python", side_effect=PermissionError("[Errno 13] Permission denied")), \
+             contextlib.redirect_stdout(out):
+            code = pf.main(["--offline", "--no-update", "--no-flush", "--json"])
+        payload = json.loads(out.getvalue())
+        self.assertEqual(code, 2)
+        self.assertIn("update", [s["step"] for s in payload["steps"]], "earlier steps and their warnings survive")
+        self.assertEqual(payload["steps"][-1]["status"], "blocked")
+
+    def test_a_server_error_does_not_blame_offline_for_the_unchecked_key(self):
+        report = pf.Report()
+        opener = FakeOpener({"search": http_error("https://seats.aero/partnerapi/search", 503, "maintenance")})
+        real = sa.SeatsAeroClient
+        with mock.patch.object(sa, "SeatsAeroClient", lambda key, **kw: real(key, opener=opener, sleep=lambda _s: None, **kw)):
+            pf.check_seats_aero("test-key", report)
+        self.assertFalse(report.verified)
+        self.assertIn("503", report.unverified)
+        self.assertNotIn("--offline", report.to_text())
+
+    def test_the_users_own_ssh_command_survives_batch_mode(self):
+        with mock.patch.dict(os.environ, {"GIT_SSH_COMMAND": "ssh -i ~/.ssh/work_key"}, clear=False):
+            env = pf.git_env()
+        self.assertEqual(env["GIT_SSH_COMMAND"], f"ssh {pf.BATCH_MODE} -i ~/.ssh/work_key",
+                         "the identity must survive, unquoted, with batch mode asked for first")
+        self.assertEqual(env["GIT_TERMINAL_PROMPT"], "0")
+
+    def test_batch_mode_wins_over_a_batch_mode_the_user_turned_off(self):
+        """ssh honours the first value for an option, so ours has to come before theirs."""
+        with mock.patch.dict(os.environ, {"GIT_SSH_COMMAND": "ssh -oBatchMode=no"}, clear=False):
+            self.assertTrue(pf.git_env()["GIT_SSH_COMMAND"].startswith(f"ssh {pf.BATCH_MODE}"))
+
+    def test_an_ssh_command_we_do_not_know_is_left_alone(self):
+        with mock.patch.dict(os.environ, {"GIT_SSH_COMMAND": "plink -batch"}, clear=False):
+            self.assertEqual(pf.git_env()["GIT_SSH_COMMAND"], "plink -batch",
+                             "an ssh flag handed to a non-OpenSSH client would break a working fetch")
+
+    def test_a_file_that_vanishes_before_its_age_is_read_is_not_a_dead_search(self):
+        """The listing and the mtime question are two syscalls; another session can act in between."""
+        reports = self.tmp / "award-reports"
+        reports.mkdir()
+        stale = reports / "awards_SIN-LHR_2026-11-14_pax2.html"
+        stale.write_text("x")
+        os.utime(stale, (0, 0))
+        real_stat = Path.stat
+
+        def vanish(self_path, *a, **kw):
+            if self_path.name.startswith("awards_"):
+                raise FileNotFoundError("gone")
+            return real_stat(self_path, *a, **kw)
+
+        report = pf.Report()
+        with mock.patch.object(Path, "stat", vanish):
+            pf.flush_stale_data(reports, report, 12, 60)
+        self.assertEqual(report.exit_code, 0)
+        self.assertEqual(report.steps[0]["status"], "ok")
+
+    def test_a_key_file_in_an_encoding_we_cannot_read_still_reports_json(self):
+        """The contract is no tracebacks and always JSON, whatever the exception type."""
+        out = io.StringIO()
+        key = Path(tempfile.mkdtemp()) / "api_key"
+        key.write_bytes("test-key".encode("utf-16"))      # a Windows editor's default
+        key.chmod(0o600)
+        with mock.patch.object(sa, "API_KEY_FILE", key), \
+             mock.patch.dict(os.environ, {"SEATS_AERO_API_KEY": "", "SEATS_API_KEY": ""}, clear=False), \
+             contextlib.redirect_stdout(out):
+            code = pf.main(["--offline", "--no-update", "--no-flush", "--json"])
+        payload = json.loads(out.getvalue())
+        self.assertEqual(code, 2)
+        self.assertFalse(payload["ready"])
+
+    def test_rate_limiting_does_not_count_as_proof_the_key_is_good(self):
+        """A 429 can come from an edge limiter that never looked at the key."""
+        report = pf.Report()
+        opener = FakeOpener({"search": http_error("https://seats.aero/partnerapi/search", 429, "slow down")})
+        real = sa.SeatsAeroClient
+        with mock.patch.object(sa, "SeatsAeroClient", lambda key, **kw: real(key, opener=opener, sleep=lambda _s: None, **kw)):
+            pf.check_seats_aero("revoked-key", report)
+        self.assertEqual(report.exit_code, 0, "a busy API is not a refused key either")
+        self.assertFalse(report.verified, "429 says nothing about whether the key still works")
+        self.assertIn("429", report.unverified)
+
+    def test_a_saved_run_named_per_route_is_still_flushed(self):
+        reports = self.tmp / "award-reports"
+        reports.mkdir()
+        ours = [reports / "run.json", reports / "run-SIN-HND.json", reports / "run_SIN_NRT.json"]
+        theirs = reports / "my-notes.json"
+        for path in [*ours, theirs]:
+            path.write_text("{}")
+            os.utime(path, (0, 0))
+        report = pf.Report()
+        pf.flush_stale_data(reports, report, 12, 60)
+        self.assertTrue(theirs.exists(), "an unrelated JSON file is not this skill's to delete")
+        for path in ours:
+            self.assertFalse(path.exists(), f"{path.name} would be re-rendered later as if it were current")
+
+    def test_report_patterns_track_the_name_the_search_tool_writes(self):
+        written = sa.default_report_path(query(origin="SIN", destination="LHR")).name
+        self.assertTrue(any(fnmatch.fnmatch(written, pattern) for pattern in pf.REPORT_PATTERNS),
+                        f"{written} matches none of {pf.REPORT_PATTERNS}, so stale reports would survive")
 
 
 if __name__ == "__main__":

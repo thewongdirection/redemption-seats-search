@@ -11,6 +11,9 @@ FlightPoints tools, saves their raw text output to files, and re-renders the rep
 
 ## Tools observed (September 2026)
 
+Captures from a live session are kept in `tests/fixtures/live/` and parsed by the regression suite, so a
+change in FlightPoints' output format shows up as a test failure rather than a silent loss of cross-checks.
+
 ### `search-flights`
 
 Arguments used: `origin`, `destination` (one airport code each), `departure_date`, `cabin_class`
@@ -49,6 +52,17 @@ Arguments: `origin`, `destination`, `departure_date`, `program` (airline-style c
 
 Flight numbers make a **flight match** possible: same date, cabin and flight-number sequence as a
 seats.aero row, regardless of program. A flight match outranks a program match in the report ordering.
+
+## Details seen live that the parser has to allow for
+
+- The results table's points column is headed `Economy` whatever cabin was asked for; only the
+  "Premium cabins (points)" block is trusted for business and first prices.
+- `get-flight-details` labels premium economy `Prem. Eco.`, which is out of scope and is skipped.
+- A programme can appear in the results table but not in the "Premium cabins" block, so the two
+  sections disagree on how many programmes were seen; only the block is parsed.
+- FlightPoints covers programmes seats.aero does not track. A label such as `Miles&Go` that reaches the
+  "Premium cabins" block stays verbatim, never matches, and is reported as an option seats.aero did not
+  have; one that only ever appears in the results table (`LifeMiles` in the captures) is never parsed at all.
 
 ## Program identifiers
 

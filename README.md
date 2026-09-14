@@ -96,6 +96,33 @@ The script refuses to take the key as a command-line argument, never prints it, 
 readable by other users. `.gitignore` excludes `.env`, `*.key` and `api_key` files, and
 `scripts/check_secrets.sh` scans tracked files for key-shaped strings (it runs in CI too).
 
+## Before each search
+
+```bash
+python3 scripts/preflight.py
+```
+
+Updates this skill to the newest version its git remote offers (clean checkouts only, fast-forward
+only), clears reports and cross-check files left over from earlier searches, and proves the key still
+works with one live call to seats.aero. Exit 0 ready, 2 fix something (no key, python too old, a file
+it could not read or delete), 3 seats.aero refused or unreachable.
+
+It deletes only what this skill writes: `awards_*.html` reports and saved runs (`run.json`,
+`run-*.json`, `run_*.json`) in the report directory, and `*.txt` dumps in `crosscheck/` beneath it -
+exactly the set `--cross-check` reads back, so nothing survives a flush only to confirm a row in a
+later search. Anything else parked in those folders is left alone, as is any file that is a symlink
+and anything under a `crosscheck/` that is one. The report directory itself is followed if it is a
+symlink, because that is where the reports were written.
+
+| Option | Effect |
+|---|---|
+| `--flush-all` | Clear every report and cross-check file, whatever its age |
+| `--max-age-hours N` | How old a report may be before it is cleared. Default 12 |
+| `--crosscheck-max-age-minutes N` | Same for cross-check dumps. Default 60 |
+| `--offline` | Skip the remote fetch and the live API call. Still exits 0, but reports `"verified": false` - the key was never put to the API |
+| `--no-update` / `--no-flush` | Leave the checkout or the old files alone (debugging) |
+| `--json` | Machine-readable report: `ready`, `verified`, `exit_code`, `blocked`, `steps` |
+
 ## Use it
 
 In Claude Code, just ask:
@@ -172,7 +199,7 @@ without it.
 5. Drop itineraries with fewer seats than requested, and dynamically-priced (`Filtered`) ones.
 6. Sort by miles, then taxes, write the HTML report, and print a markdown table (or JSON with `--json`).
 
-The HTML report is a single self-contained file: no JavaScript, no external fonts or scripts, every value
+The HTML report is a single self-contained file: no external fonts, styles or scripts; the only JavaScript is the inline column sorter, every value
 HTML-escaped and only `https://` links emitted. Booking deep links come from seats.aero when available; otherwise
 the *Book* button falls back to the program's award-search page.
 
@@ -189,9 +216,26 @@ drive a seats.aero MCP server.
 ## Development
 
 ```bash
-./run_tests.sh              # 110 offline unit tests, network mocked
+./run_tests.sh              # 198 offline unit tests, network mocked
 ./scripts/check_secrets.sh  # credential scan
 ```
+
+### Batch testing a matrix of routes and months
+
+`tests/batch_matrix.py` drives the real command line against a simulated Partner API
+(`tests/fake_seats_aero.py`) for a random draw of routes across consecutive months, and checks the
+invariants a user relies on: the cabin, date-window and party-size filters hold, rows are ordered by
+price, the HTML report is self-contained and escapes hostile text, the API key never reaches any
+output, and the markdown re-render agrees with the JSON. It also runs the option variants
+(`--direct-only`, `--cabins first`, `--sources`, `--no-refresh`, `--flex`, `--max-trip-lookups 0`),
+the input checks and a cross-check against FlightPoints output captured live.
+
+```bash
+python3 tests/batch_matrix.py --routes 10 --months 10 --pax 2   # 100 searches, no key, no network
+```
+
+Exit code 0 means every scenario passed; failures are listed in the JSON it prints. `run_tests.sh`
+runs a 2x2 slice of the same harness so it stays working.
 
 ## Layout
 
@@ -202,9 +246,10 @@ references/flightpoints.md   observed FlightPoints tool formats and match rules
 SETUP.md                     step-by-step onboarding for a new user
 CLAUDE.md                    points Claude at SKILL.md in web sessions on this repo
 scripts/search_awards.py     the search tool (seats.aero)
+scripts/preflight.py         update, flush and prerequisite checks run before each search
 scripts/check_secrets.sh     credential scanner
 references/                  API notes and MCP alternative
-tests/                       regression suite and API fixtures
+tests/                       regression suite, API fixtures, batch matrix harness
 award-reports/               generated HTML reports (git-ignored)
 .github/workflows/ci.yml     runs the scan and tests on every push
 ```

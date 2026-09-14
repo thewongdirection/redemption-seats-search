@@ -36,7 +36,9 @@ from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable, Iterator, Sequence
 
-sys.path.insert(0, str(Path(__file__).resolve().parent))
+_SCRIPT_DIR = str(Path(__file__).resolve().parent)
+if _SCRIPT_DIR not in sys.path:
+    sys.path.append(_SCRIPT_DIR)   # append, so a caller's own modules keep priority
 import crosscheck  # noqa: E402  (sibling module: FlightPoints cross-check parsing and matching)
 
 BASE_URL = "https://seats.aero/partnerapi"
@@ -256,10 +258,10 @@ class SeatsAeroClient:
     def get(self, path: str, params: dict[str, Any] | None = None) -> dict[str, Any]:
         return self._request(path, params=params)
 
-    def post(self, path: str, body: dict[str, Any], *, counted: bool = True) -> dict[str, Any]:
-        return self._request(path, body=body, counted=counted)
+    def post(self, path: str, body: dict[str, Any], *, counted: bool = True, cost: int = 1) -> dict[str, Any]:
+        return self._request(path, body=body, counted=counted, cost=cost)
 
-    def _request(self, path: str, params: dict[str, Any] | None = None, body: dict[str, Any] | None = None, *, counted: bool = True) -> dict[str, Any]:
+    def _request(self, path: str, params: dict[str, Any] | None = None, body: dict[str, Any] | None = None, *, counted: bool = True, cost: int = 1) -> dict[str, Any]:
         query = {k: _param_value(v) for k, v in (params or {}).items() if v is not None}
         url = f"{self._base_url}/{path.lstrip('/')}"
         if query:
@@ -273,7 +275,7 @@ class SeatsAeroClient:
         for attempt in range(self._max_retries + 1):
             try:
                 if counted:
-                    self.calls_made += 1
+                    self.calls_made += cost
                 with self._opener(request, self._timeout) as response:
                     return json.loads(response.read().decode("utf-8"))
             except urllib.error.HTTPError as err:
@@ -340,7 +342,9 @@ class SeatsAeroClient:
         Statuses seen: queued, processing, succeeded, failed, skipped_outage.
         Polls (poll=True) are free on the seats.aero side, so they are left out of calls_made.
         """
-        return self.post("refresh", {"availability_ids": list(availability_ids)}, counted=not poll)
+        ids = list(availability_ids)
+        # seats.aero charges the daily quota per record re-scraped, not per request.
+        return self.post("refresh", {"availability_ids": ids}, counted=not poll, cost=max(len(ids), 1))
 
     def refresh_and_wait(
         self,
@@ -609,7 +613,8 @@ def _fetch_candidates(client: SeatsAeroClient, query: SearchQuery, log: Callable
 
 
 def _refresh_stale(client: SeatsAeroClient, candidates: list[dict[str, Any]], query: SearchQuery, log: Callable[[str], None]) -> RefreshOutcome | None:
-    stale = [a for a in candidates if _hours_since(str(a.get("UpdatedAt") or "")) > query.refresh_older_than_hours]
+    stale = [a for a in candidates
+             if a.get("ID") and _hours_since(str(a.get("UpdatedAt") or "")) > query.refresh_older_than_hours]
     if not stale:
         log(f"refresh: nothing older than {query.refresh_older_than_hours:g}h to refresh")
         return None
@@ -645,7 +650,8 @@ def run_search(client: SeatsAeroClient, query: SearchQuery, log: Callable[[str],
 
     for availability in candidates:
         cabins_open = premium_cabins_available(availability, query.cabins)
-        if lookups >= query.max_trip_lookups:
+        if lookups >= query.max_trip_lookups or not availability.get("ID"):
+            # No ID means no /trips call and no refresh; the program-level row is all this record can give.
             options.extend(_summary_options(availability, cabins_open, query))
             continue
         lookups += 1
@@ -675,6 +681,13 @@ def run_search(client: SeatsAeroClient, query: SearchQuery, log: Callable[[str],
         notes.append(f"Some results are cached data older than {STALE_AFTER_HOURS}h (see Updated column); re-verify on the program's site before transferring points.")
     if query.pax > 1:
         notes.append(f"Filtered to itineraries reporting at least {query.pax} seats; programs that hide seat counts are kept and flagged.")
+    if query.direct_only:
+        unknown = sum(1 for o in options if o.stops < 0)
+        note = "Filtered to nonstop itineraries; anything seats.aero reports as connecting was dropped."
+        if unknown:
+            note += (f" {unknown} program-level row(s) are shown with '?' stops because seats.aero publishes no "
+                     "nonstop flag for them; confirm on the program's site.")
+        notes.append(note)
     if query.date_mode == "schedule-opening":
         notes.append(f"No date was given, so this scanned {SCHEDULE_OPENING_DAYS[0]}-{SCHEDULE_OPENING_DAYS[1]} days out, where airlines first release award inventory.")
 
@@ -702,8 +715,13 @@ def _cheapest_premium_cost(availability: dict[str, Any], cabins: Sequence[str]) 
     return min((c for c in costs if c > 0), default=10**9)
 
 
-def _availability_cost(availability: dict[str, Any], cabin: str) -> int:
+def _availability_cost(availability: dict[str, Any], cabin: str, direct: bool = False) -> int:
+    """Cheapest price the record reports for the cabin; with direct=True, for its nonstop space."""
     code = CABIN_CODES[cabin]
+    if direct:
+        nonstop = _to_int(availability.get(f"{code}DirectMileageCost"))
+        if nonstop > 0:
+            return nonstop
     raw = availability.get(f"{code}MileageCostRaw")
     if isinstance(raw, int) and raw > 0:
         return raw
@@ -721,13 +739,13 @@ def _trip_options(availability: dict[str, Any], payload: dict[str, Any], query: 
             continue
         if trip.get("Filtered"):
             continue
-        stops = _to_int(trip.get("Stops"))
+        segments = sorted(trip.get("AvailabilitySegments") or [], key=lambda s: _to_int(s.get("Order")))
+        stops = _trip_stops(trip, segments)
         if query.direct_only and stops > 0:
             continue
         seats = _to_int(trip.get("RemainingSeats"))
         if 0 < seats < query.pax:
             continue
-        segments = sorted(trip.get("AvailabilitySegments") or [], key=lambda s: _to_int(s.get("Order")))
         options.append(
             AwardOption(
                 program=PROGRAM_NAMES.get(source, source),
@@ -755,13 +773,43 @@ def _trip_options(availability: dict[str, Any], payload: dict[str, Any], query: 
     return options
 
 
+def _cabin_field(availability: dict[str, Any], code: str, name: str, direct: bool) -> Any:
+    """Read {X}Direct<name> when a nonstop-only search asked for it, else {X}<name>."""
+    if direct:
+        value = availability.get(f"{code}Direct{name}")
+        # 0 is a real answer ("the program does not publish a count"), so only a truly
+        # absent or empty field falls back to the cabin-wide figure.
+        if value is not None and value != "":
+            return value
+    return availability.get(f"{code}{name}")
+
+
+def _trip_stops(trip: dict[str, Any], segments: Sequence[dict[str, Any]]) -> int:
+    """Stops on this itinerary. An absent "Stops" means unknown (-1), never nonstop: the segments
+    or flight numbers usually say, and a guess of 0 would smuggle a connection past --direct-only."""
+    raw = trip.get("Stops")
+    if raw is not None and str(raw).strip() != "":
+        return _to_int(raw)
+    legs = len(segments) or len(_split_codes(trip.get("FlightNumbers")))
+    return legs - 1 if legs else -1
+
+
 def _summary_options(availability: dict[str, Any], cabins_open: Sequence[str], query: SearchQuery, reason: str = "") -> list[AwardOption]:
     """Program-level rows built from the Availability object alone (no flight numbers)."""
     source = availability.get("Source", "")
     options = []
     for cabin in cabins_open:
         code = CABIN_CODES[cabin]
-        seats = _to_int(availability.get(f"{code}RemainingSeats"))
+        # Absent means seats.aero did not say either way (it omits {X}Direct on some records),
+        # which is not the same as "needs a connection".
+        direct = availability.get(f"{code}Direct")
+        if query.direct_only and direct is False:
+            continue
+        # A nonstop-only report must quote the nonstop space, not the cabin's cheapest space,
+        # which may well be a connection. These {X}Direct* fields are newer and can be missing,
+        # so each falls back to the cabin-wide figure.
+        nonstop_only = bool(query.direct_only and direct)
+        seats = _to_int(_cabin_field(availability, code, "RemainingSeats", nonstop_only))
         if 0 < seats < query.pax:
             continue
         options.append(
@@ -771,14 +819,14 @@ def _summary_options(availability: dict[str, Any], cabins_open: Sequence[str], q
                 cabin=cabin,
                 travel_date=str(availability.get("Date", query.start_date.isoformat())),
                 route=_route_label(availability, query),
-                airlines=_unique(_split_codes(availability.get(f"{code}Airlines"))),
+                airlines=_unique(_split_codes(_cabin_field(availability, code, "Airlines", nonstop_only))),
                 flight_numbers=reason or "see program site",
                 departs_at="",
                 arrives_at="",
                 duration_minutes=0,
-                stops=-1 if not availability.get(f"{code}Direct") else 0,
+                stops=0 if direct else -1,
                 remaining_seats=seats,
-                mileage_cost=_availability_cost(availability, cabin),
+                mileage_cost=_availability_cost(availability, cabin, direct=nonstop_only),
                 taxes_minor_units=_to_int(availability.get(f"{code}TotalTaxes")),
                 taxes_currency=str(availability.get("TaxesCurrency") or ""),
                 booking_link="",
@@ -847,9 +895,13 @@ def _parse_time(value: str) -> datetime | None:
 
 
 def _hours_since(value: str) -> float:
+    """Age of a timestamp in hours; infinite when seats.aero gave none we can read.
+
+    Unknown age must not read as "fresh": those records are the ones most worth re-scraping.
+    """
     parsed = _parse_time(value)
     if parsed is None:
-        return 0.0
+        return float("inf")
     if parsed.tzinfo is None:
         parsed = parsed.replace(tzinfo=timezone.utc)
     return (datetime.now(timezone.utc) - parsed).total_seconds() / 3600
@@ -909,6 +961,8 @@ def format_age(updated_at: str) -> str:
     if not updated_at:
         return "-"
     hours = _hours_since(updated_at)
+    if hours == float("inf"):
+        return "unknown"
     if hours < 0:
         return "just now"
     if hours < 1:
@@ -930,7 +984,7 @@ def apply_cross_check(result: SearchResult, paths: Sequence[Path], log: Callable
     """Match FlightPoints output files against the seats.aero rows and regroup the report."""
     # A --load run may already carry notes from an earlier cross-check; this one supersedes them.
     result.notes = [n for n in result.notes if not any(m in n for m in CROSS_CHECK_NOTE_MARKERS)]
-    entries, files, empty_files = crosscheck.load_files(list(paths))
+    entries, files, empty_files, skipped_files = crosscheck.load_files(list(paths))
     before = len(entries)
     entries = [e for e in entries if crosscheck.entry_in_scope(e, result.query)]
     if len(entries) < before:
@@ -939,6 +993,7 @@ def apply_cross_check(result: SearchResult, paths: Sequence[Path], log: Callable
     summary.out_of_scope = before - len(entries)
     summary.files = files
     summary.empty_files = empty_files
+    summary.skipped_files = skipped_files
     result.crosscheck = summary
     sort_options(result.options)
     confirmed = summary.flight_matches + summary.program_matches
@@ -951,7 +1006,11 @@ def apply_cross_check(result: SearchResult, paths: Sequence[Path], log: Callable
             result.notes.insert(0, f"FlightPoints was queried ({files} searches) and reported no business or first space on this route and date(s), "
                                    "so none of these rows is confirmed by a second source. Treat them as seats.aero-only until you check the program's site.")
         else:
-            result.notes.insert(0, f"Cross-check requested but no FlightPoints entries could be read from {files} file(s); rows are seats.aero only.")
+            note = f"Cross-check requested but no FlightPoints entries could be read from {files} file(s); rows are seats.aero only."
+            if skipped_files:
+                note += (f" {skipped_files} file(s) in the cross-check directory were not read: a directory contributes "
+                         f"its {crosscheck.DUMP_SUFFIX} dumps, so save FlightPoints output with that extension, or name the file directly.")
+            result.notes.insert(0, note)
         return
     note = (f"Cross-checked against FlightPoints ({len(entries)} entries): {confirmed} of {len(result.options)} rows confirmed by both sources"
             f" ({summary.flight_matches} by exact flight, {summary.program_matches} by program and price) and grouped at the top.")
@@ -989,6 +1048,7 @@ def load_result(path: Path) -> SearchResult:
         c = payload["crosscheck"]
         cross = crosscheck.CrossCheckSummary(
             entries=int(c.get("entries", 0)), files=int(c.get("files", 0)), empty_files=int(c.get("empty_files", 0)),
+            skipped_files=int(c.get("skipped_files", 0)),
             flight_matches=int(c.get("flight_matches", 0)), program_matches=int(c.get("program_matches", 0)),
             price_disagreements=list(c.get("price_disagreements") or []), unmatched=list(c.get("unmatched") or []),
             out_of_scope=int(c.get("out_of_scope", 0)),
@@ -1019,6 +1079,11 @@ def booking_url(option: AwardOption) -> str:
 
 def airline_url(code: str) -> str:
     return AIRLINE_URLS.get(code, "")
+
+
+# Every report this tool writes matches this glob; preflight clears stale ones by it, so the two
+# stay in step when the name below changes.
+REPORT_GLOB = "awards_*.html"
 
 
 def default_report_path(query: SearchQuery, report_dir: Path = DEFAULT_REPORT_DIR) -> Path:
@@ -1240,7 +1305,9 @@ table{border-collapse:separate;border-spacing:0;width:100%;font-size:13px}
 th,td{padding:7px 6px;text-align:left;vertical-align:top;border-bottom:1px solid var(--border);white-space:nowrap;background:var(--surface)}
 th{font-size:11px;text-transform:uppercase;letter-spacing:.05em;color:var(--muted);background:var(--surface-2);position:sticky;top:0;z-index:1}
 th[data-col]{cursor:pointer;user-select:none}
-th[data-col]:hover,th[data-col]:focus-visible{color:var(--text);outline:none}
+th[data-col] button{all:unset;cursor:pointer;font:inherit;color:inherit;letter-spacing:inherit;text-transform:inherit}
+th[data-col]:hover{color:var(--text)}
+th[data-col] button:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
 th[data-col]::after{content:"↕";opacity:.35;margin-left:4px;font-size:10px}
 th[aria-sort=ascending]::after{content:"↑";opacity:1}
 th[aria-sort=descending]::after{content:"↓";opacity:1}
@@ -1342,7 +1409,7 @@ def _html_summary_cards(result: SearchResult) -> str:
 def _html_table(result: SearchResult) -> str:
     columns = html_columns(result.query, result.crosscheck is not None)
     head = "".join(
-        f'<th{_css(c.css)}{_sortable_attrs(n, c)}>{_esc(c.header)}</th>' for n, c in enumerate(columns)
+        f'<th{_css(c.css)}{_sortable_attrs(n, c)}>{_header_html(c)}</th>' for n, c in enumerate(columns)
     )
     rows = "".join(
         _css_tr(o) + "".join(f"<td{_css(c.css)}{_sort_attr(c, idx, o)}>{c.html(idx, o)}</td>" for c in columns) + "</tr>"
@@ -1355,10 +1422,17 @@ def _html_table(result: SearchResult) -> str:
 
 
 def _sortable_attrs(index: int, column: Column) -> str:
-    """Headers are styled and wired through data-col, so no extra class is needed."""
+    """A sortable header stays a columnheader - aria-sort is only meaningful on one - and carries
+    a real button inside it (see _header_html) for pointer and keyboard use."""
     if column.sort is None:
         return ""
-    return f' data-col="{index}" tabindex="0" role="button" aria-sort="none" title="Sort by {_esc(column.header)}"'
+    return f' data-col="{index}" aria-sort="none"'
+
+
+def _header_html(column: Column) -> str:
+    if column.sort is None:
+        return _esc(column.header)
+    return f'<button type="button" title="Sort by {_esc(column.header)}">{_esc(column.header)}</button>'
 
 
 def _sort_attr(column: Column, idx: int, option: AwardOption) -> str:
@@ -1375,13 +1449,14 @@ SORT_SCRIPT = """
   if (!table) return;
   var body = table.tBodies[0];
   var heads = [].slice.call(table.tHead.rows[0].cells);
+  var NUMERIC = /^-?\\d+(\\.\\d+)?$/;   // a whole number only: parseFloat("2026-11-20") is 2026
   function keyOf(row, col) {
     var cell = row.cells[col];
     return cell && cell.hasAttribute('data-sort') ? cell.getAttribute('data-sort') : '';
   }
   function sortBy(col, dir) {
     var rows = [].slice.call(body.rows);
-    var numeric = rows.every(function (r) { var k = keyOf(r, col); return k === '' || !isNaN(parseFloat(k)); });
+    var numeric = rows.every(function (r) { var k = keyOf(r, col); return k === '' || NUMERIC.test(k); });
     rows.sort(function (a, b) {
       var x = keyOf(a, col), y = keyOf(b, col);
       var cmp = numeric ? (parseFloat(x || 'Infinity') - parseFloat(y || 'Infinity')) : x.localeCompare(y);
@@ -1400,15 +1475,25 @@ SORT_SCRIPT = """
   }
   heads.forEach(function (head) {
     if (!head.hasAttribute('data-col')) return;
-    head.addEventListener('click', function () { activate(head); });
-    head.addEventListener('keydown', function (e) {
-      if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); activate(head); }
-    });
+    var trigger = head.querySelector('button');
+    if (trigger) {
+      trigger.addEventListener('click', function () { activate(head); });   // Enter and Space come free
+    } else {
+      head.addEventListener('click', function () { activate(head); });
+    }
   });
   var m = /^#sort=(\\d+):(asc|desc)$/.exec(location.hash || '');
   if (m) sortBy(parseInt(m[1], 10), m[2] === 'desc' ? 'descending' : 'ascending');
 })();
 """
+
+
+def _quota_text(result: SearchResult) -> str:
+    """The daily quota seats.aero reported on this run, when it reported one."""
+    quota = (result.refresh.quota if result.refresh else None) or {}
+    if not quota.get("limit"):
+        return ""
+    return f" · daily quota {_esc(quota.get('remaining'))}/{_esc(quota.get('limit'))} left"
 
 
 def _css(css: str) -> str:
@@ -1452,11 +1537,11 @@ def render_html(result: SearchResult) -> str:
         '<meta name="viewport" content="width=device-width,initial-scale=1">'
         f"<title>{_esc(title)}</title><style>{HTML_STYLE}</style></head><body><main>"
         f'<h1>{_esc(q.origin_label)}<span class="arrow">→</span>{_esc(q.destination_label)}</h1>'
-        f'<p class="sub">{_esc(q.cabins_label.capitalize())} class award availability from seats.aero. Miles and taxes are per passenger. '
+        f'<p class="sub">{_esc(q.cabins_label.capitalize())} class award availability from seats.aero. Miles are per passenger, as are the taxes in the summary cards. '
         "Book links open the mileage program that holds the space; airline links open the operating carrier."
         + (" Rows marked ✓ 2 sources were also found by FlightPoints and are listed first." if result.crosscheck is not None else "") + "</p>"
         f'<div class="chips">{chips_html}</div>{body}{notes_html}'
-        f"<footer>Generated {_esc(result.generated_at)} · {result.api_calls} seats.aero API calls · cached data, verify before transferring points.</footer>"
+        f"<footer>Generated {_esc(result.generated_at)} · {result.api_calls} seats.aero API calls{_quota_text(result)} · cached data, verify before transferring points.</footer>"
         "</main></body></html>"
     )
 
@@ -1539,7 +1624,7 @@ def parse_args(argv: Sequence[str] | None = None, today: date | None = None) -> 
                 raise UsageError(f"--date to --end-date spans more than {MAX_RANGE_DAYS} days; split it into shorter runs")
             start_date, date_mode = travel_date, "range"
         else:
-            start_date = travel_date - timedelta(days=args.flex)
+            start_date = max(travel_date - timedelta(days=args.flex), today)   # never search days that have gone
             end_date = travel_date + timedelta(days=args.flex)
             date_mode = "flex" if args.flex else "exact"
     if not 1 <= args.pax <= 9:

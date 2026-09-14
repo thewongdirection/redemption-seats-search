@@ -18,6 +18,6 @@ jobs:
       - name: Secret scan
         run: ./scripts/check_secrets.sh
       - name: Byte-compile
-        run: python3 -m py_compile scripts/search_awards.py
+        run: python3 -m py_compile scripts/search_awards.py scripts/crosscheck.py scripts/preflight.py
       - name: Regression tests
         run: ./run_tests.sh

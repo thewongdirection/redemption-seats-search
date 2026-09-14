@@ -1,0 +1,28 @@
+Award Flight Search: CDG → LAX
+Date: 2027-02-15  |  Cabin: Business  |  Passengers: 2
+
+Search complete. Found 15 award flight option(s).
+
+Results (15 of 15) — the **Book** column links to FlightPoints:
+
+| # | Program | Airline | Economy | Seats | Stops | Book |
+|---|---------|---------|---------|-------|-------|------|
+| 14 | [Velocity Frequent Flyer](https://flightpoints.com/i/eJwLc6xxdnGv8XGMqDEyMDLXNTDSNTQFAEXbBaw) | Virgin Australia | 80,000 + $289 | 4 | 1 stop(s) | [Book ↗](https://flightpoints.com/i/eJwLc6xxdnGv8XGMqDEyMDLXNTDSNTQFAEXbBaw) |
+| 15 | [Flying Club](https://flightpoints.com/i/eJwLC65xdnGv8XGMqDEyMDLXNTDSNTQFAEdDBb4) | Virgin Atlantic | 13,000 + $261 | 1 | 1 stop(s) | [Book ↗](https://flightpoints.com/i/eJwLC65xdnGv8XGMqDEyMDLXNTDSNTQFAEdDBb4) |
+
+Premium cabins (points):
+- AAdvantage: Prem 40,000+$408 · Biz 57,500+$1104
+- Aeroplan: Prem 78,919+$216 · Biz 90,000+$326
+- Flying Blue: Prem 76,980+$420 · Biz 131,500+$529
+- Aeromexico Rewards: Prem 277,700+$206 · Biz 225,000+$291
+- Atmos Rewards: Prem 45,000+$401 · Biz 70,000+$1124 · First 375,000+$308
+- TrueBlue: Biz 589,700+$229
+- SkyMiles: Prem 115,000+$137 · Biz 370,000+$230 · First 370,000+$230
+- Etihad Guest: Biz 119,999+$450
+- Smiles: Biz 108,700
+- Frequent Flyer: Biz 143,000+$740
+- Miles&Smiles: Biz 175,000
+- MileagePlus: Prem 180,000+$133 · Biz 88,000+$259
+- Flying Club: Prem 70,000+$363
+
+**[See all options on FlightPoints ↗](https://flightpoints.com/search?origins=CDG&destinations=LAX&date=2027-02-15)**

@@ -81,8 +81,20 @@ chmod 600 ~/.config/seats-aero/api_key
 
 ### A3. Check that everything works
 
+Run the preflight first - it checks the key, the network and your python in one go, and tells you
+exactly which of them is wrong if something is:
+
 ```bash
-cd ~/redemption-seats-search
+cd ~/redemption-seats-search      # the skill root: run preflight and searches from the same place
+python3 scripts/preflight.py
+```
+
+It also updates the skill to the newest version and clears stale reports, which is what it does before
+every search from then on. Run it from the directory you run searches in, so that the `award-reports/`
+it clears is the one they write to (the line it prints names that directory, so a run from the wrong
+place is obvious).
+
+```bash
 ./run_tests.sh                                                  # offline; should end with "OK"
 python3 scripts/search_awards.py SIN LHR --pax 1 --no-refresh   # live, cached data only, costs 1-10 calls
 ```
@@ -178,7 +190,7 @@ for it (usually 10 to 30 seconds, up to 2 minutes), then reports. Measured on re
 | A full month (`--end-date`) | 2–4 min | 60–150 |
 | Any of the above with `--no-refresh` | 2–15 s | 1–40 |
 
-The report footer shows your remaining quota after each run. At most 100 records are refreshed per run,
+The report footer shows your remaining quota after any run that refreshed records (seats.aero reports it with the refresh, so a `--no-refresh` run cannot show it). At most 100 records are refreshed per run,
 oldest first, and polling is free. The quota resets at midnight UTC. If you plan several month-long scans in
 one day, use `--no-refresh` for the exploratory ones and refresh only the search you intend to book from.
 
