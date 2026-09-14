@@ -713,7 +713,7 @@ class CrossCheckParsingTests(unittest.TestCase):
         self.assertEqual(cc.parse_text("{not json"), [])
 
     def test_load_files_walks_directories(self):
-        entries, files, empty = cc.load_files([FIXTURES])
+        entries, files, empty, _skipped = cc.load_files([FIXTURES])
         self.assertGreaterEqual(files, 3)
         self.assertGreaterEqual(len(entries), 9)
         self.assertEqual(empty, 0)
@@ -723,7 +723,7 @@ class CrossCheckParsingTests(unittest.TestCase):
         (tmp / "a.txt").write_text("Award Flight Search: SIN → HKG\nDate: 2026-11-06  |  Cabin: Business  |  Passengers: 2\n\nSearch complete. Found 0 award flight option(s).\n\nNo flights found matching your criteria.\n")
         (tmp / "b.txt").write_text("No detailed flight information found.\n")
         (tmp / "c.txt").write_text("Error: FlightPoints API 400 for /search/key/\n")
-        entries, files, empty = cc.load_files([tmp])
+        entries, files, empty, _skipped = cc.load_files([tmp])
         self.assertEqual((len(entries), files, empty), (0, 3, 2))
         self.assertTrue(cc.is_empty_result("Search complete. Found 0 award flight option(s)."))
         self.assertFalse(cc.is_empty_result("Error: FlightPoints API 400"))
@@ -1490,7 +1490,7 @@ class EmptyFlightPointsResultTests(unittest.TestCase):
                 "Search complete. Found 14 award flight option(s).\n\n"
                 "| # | Program | Airline | Economy | Seats | Stops | Book |\n"
                 "| 1 | [AAdvantage](https://x) | American Airlines | 35,000 + $6 | 1 | Direct | [Book](https://x) |\n")
-        entries, files, empty = cc.load_files([self.files(economy_only=text)])
+        entries, files, empty, _skipped = cc.load_files([self.files(economy_only=text)])
         self.assertEqual((len(entries), files, empty), (0, 1, 1))
         self.assertTrue(cc.CrossCheckSummary(entries=0, files=1, empty_files=1).answered)
 
@@ -1499,14 +1499,14 @@ class EmptyFlightPointsResultTests(unittest.TestCase):
         text = ("Found 2 detailed flight option(s).\n\n"
                 "1. [AC](https://x): SIN → HKG\n   Departs: 2026-11-06 10:00:00\n"
                 "   Prem. Eco.: 85,000 pts + 22.00 taxes  |  2 seat(s)\n")
-        entries, files, empty = cc.load_files([self.files(economy_details=text)])
+        entries, files, empty, _skipped = cc.load_files([self.files(economy_details=text)])
         self.assertEqual((len(entries), files, empty), (0, 1, 1))
 
     def test_a_changed_premium_block_still_reads_as_unreadable(self):
         # The section is there but nothing parses: that is a format change, not "no space".
         text = ("Award Flight Search: SIN → HKG\nDate: 2026-11-06  |  Cabin: Business\n\n"
                 "Premium cabins (points):\n- Aeroplan -- business class for 52500 points\n")
-        entries, files, empty = cc.load_files([self.files(new_format=text)])
+        entries, files, empty, _skipped = cc.load_files([self.files(new_format=text)])
         self.assertEqual((len(entries), files, empty), (0, 1, 0))
         self.assertFalse(cc.CrossCheckSummary(entries=0, files=1, empty_files=0).answered)
 
@@ -1996,9 +1996,7 @@ class PreflightSafetyTests(unittest.TestCase):
     @unittest.skipUnless(shutil.which("git"), "git is not installed")
     def test_a_status_that_fails_is_not_read_as_a_clean_tree(self):
         origin, clone = make_checkout(self.tmp)
-        (origin / "SKILL.md").write_text("v2\n")
-        git(["add", "-A"], origin)
-        git(["commit", "--quiet", "-m", "second"], origin)
+        publish(origin, "v2\n")
         real = pf.git
 
         def fail_status(args, root):
@@ -2032,15 +2030,35 @@ class PreflightSafetyTests(unittest.TestCase):
         self.assertEqual(seen["max_retries"], 0, "a preflight must answer now, not wait out a Retry-After")
 
     def test_the_flush_and_the_cross_check_agree_on_what_a_dump_is(self):
-        """Anything a search would read out of crosscheck/ is something a flush must be able to clear."""
+        """Anything a search reads out of crosscheck/ must be something a flush can clear.
+
+        A file on one side only is the bug: read-but-never-flushed lets yesterday's availability
+        confirm today's rows forever, and flushed-but-never-read deletes evidence in use.
+        """
         crosscheck_dir = self.tmp / "award-reports" / pf.CROSSCHECK_DIR
         crosscheck_dir.mkdir(parents=True)
-        for name in ("search-SIN-HND.txt", "notes.md", "dump.json"):
+        outside = self.tmp / "elsewhere.txt"
+        outside.write_text("Premium cabins\n")
+        for name in ("search-SIN-HND.txt", "SEARCH-SIN-NRT.TXT", "notes.md", "dump.json", "plain"):
             (crosscheck_dir / name).write_text("Premium cabins\n")
-        read = {path.name for path in sorted(crosscheck_dir.iterdir())
-                if any(fnmatch.fnmatch(path.name, pattern) for pattern in pf.CROSSCHECK_PATTERNS)}
-        _entries, files, _empty = crosscheck.load_files([crosscheck_dir])
-        self.assertEqual(files, len(read), "a search must read exactly the set a flush can clear")
+        (crosscheck_dir / "linked.txt").symlink_to(outside)
+
+        flushed = {path.name for path in pf._expired(crosscheck_dir, crosscheck.is_dump, time.time(), 0, True)}
+        read = {path.name for path in sorted(crosscheck_dir.iterdir()) if crosscheck.is_dump(path)}
+        self.assertEqual(flushed, read, "a search must read exactly the set a flush can clear")
+        self.assertEqual(read, {"search-SIN-HND.txt", "SEARCH-SIN-NRT.TXT"},
+                         "a dump is a .txt in any case, and never a symlink out of the folder")
+
+    def test_files_a_cross_check_directory_skips_are_reported_not_swallowed(self):
+        crosscheck_dir = self.tmp / "crosscheck"
+        crosscheck_dir.mkdir()
+        (crosscheck_dir / "search-SIN-HND.md").write_text("Premium cabins\n")   # saved with the wrong extension
+        _entries, files, _empty, skipped = crosscheck.load_files([crosscheck_dir])
+        self.assertEqual((files, skipped), (0, 1))
+
+        result = sa.SearchResult(query=query(), options=[], notes=[], api_calls=0, availabilities_seen=0, generated_at="now")
+        sa.apply_cross_check(result, [crosscheck_dir])
+        self.assertIn("were not read", " ".join(result.notes), "a directory of unread files must say so")
 
     def test_a_file_that_vanishes_mid_flush_is_a_warning_not_a_dead_search(self):
         reports = self.tmp / "award-reports"
@@ -2077,14 +2095,81 @@ class PreflightSafetyTests(unittest.TestCase):
     def test_the_users_own_ssh_command_survives_batch_mode(self):
         with mock.patch.dict(os.environ, {"GIT_SSH_COMMAND": "ssh -i ~/.ssh/work_key"}, clear=False):
             env = pf.git_env()
-        self.assertIn("-i ~/.ssh/work_key", env["GIT_SSH_COMMAND"], "the identity the remote needs must be kept")
-        self.assertIn(pf.BATCH_MODE, env["GIT_SSH_COMMAND"])
+        self.assertEqual(env["GIT_SSH_COMMAND"], f"ssh {pf.BATCH_MODE} -i ~/.ssh/work_key",
+                         "the identity must survive, unquoted, with batch mode asked for first")
         self.assertEqual(env["GIT_TERMINAL_PROMPT"], "0")
 
+    def test_batch_mode_wins_over_a_batch_mode_the_user_turned_off(self):
+        """ssh honours the first value for an option, so ours has to come before theirs."""
+        with mock.patch.dict(os.environ, {"GIT_SSH_COMMAND": "ssh -oBatchMode=no"}, clear=False):
+            self.assertTrue(pf.git_env()["GIT_SSH_COMMAND"].startswith(f"ssh {pf.BATCH_MODE}"))
+
+    def test_an_ssh_command_we_do_not_know_is_left_alone(self):
+        with mock.patch.dict(os.environ, {"GIT_SSH_COMMAND": "plink -batch"}, clear=False):
+            self.assertEqual(pf.git_env()["GIT_SSH_COMMAND"], "plink -batch",
+                             "an ssh flag handed to a non-OpenSSH client would break a working fetch")
+
+    def test_a_file_that_vanishes_before_its_age_is_read_is_not_a_dead_search(self):
+        """The listing and the mtime question are two syscalls; another session can act in between."""
+        reports = self.tmp / "award-reports"
+        reports.mkdir()
+        stale = reports / "awards_SIN-LHR_2026-11-14_pax2.html"
+        stale.write_text("x")
+        os.utime(stale, (0, 0))
+        real_stat = Path.stat
+
+        def vanish(self_path, *a, **kw):
+            if self_path.name.startswith("awards_"):
+                raise FileNotFoundError("gone")
+            return real_stat(self_path, *a, **kw)
+
+        report = pf.Report()
+        with mock.patch.object(Path, "stat", vanish):
+            pf.flush_stale_data(reports, report, 12, 60)
+        self.assertEqual(report.exit_code, 0)
+        self.assertEqual(report.steps[0]["status"], "ok")
+
+    def test_a_key_file_in_an_encoding_we_cannot_read_still_reports_json(self):
+        """The contract is no tracebacks and always JSON, whatever the exception type."""
+        out = io.StringIO()
+        key = Path(tempfile.mkdtemp()) / "api_key"
+        key.write_bytes("test-key".encode("utf-16"))      # a Windows editor's default
+        key.chmod(0o600)
+        with mock.patch.object(sa, "API_KEY_FILE", key), \
+             mock.patch.dict(os.environ, {"SEATS_AERO_API_KEY": "", "SEATS_API_KEY": ""}, clear=False), \
+             contextlib.redirect_stdout(out):
+            code = pf.main(["--offline", "--no-update", "--no-flush", "--json"])
+        payload = json.loads(out.getvalue())
+        self.assertEqual(code, 2)
+        self.assertFalse(payload["ready"])
+
+    def test_rate_limiting_does_not_count_as_proof_the_key_is_good(self):
+        """A 429 can come from an edge limiter that never looked at the key."""
+        report = pf.Report()
+        opener = FakeOpener({"search": http_error("https://seats.aero/partnerapi/search", 429, "slow down")})
+        real = sa.SeatsAeroClient
+        with mock.patch.object(sa, "SeatsAeroClient", lambda key, **kw: real(key, opener=opener, sleep=lambda _s: None, **kw)):
+            pf.check_seats_aero("revoked-key", report)
+        self.assertEqual(report.exit_code, 0, "a busy API is not a refused key either")
+        self.assertFalse(report.verified, "429 says nothing about whether the key still works")
+        self.assertIn("429", report.unverified)
+
+    def test_a_saved_run_named_per_route_is_still_flushed(self):
+        reports = self.tmp / "award-reports"
+        reports.mkdir()
+        ours = [reports / "run.json", reports / "run-SIN-HND.json", reports / "run_SIN_NRT.json"]
+        theirs = reports / "my-notes.json"
+        for path in [*ours, theirs]:
+            path.write_text("{}")
+            os.utime(path, (0, 0))
+        report = pf.Report()
+        pf.flush_stale_data(reports, report, 12, 60)
+        self.assertTrue(theirs.exists(), "an unrelated JSON file is not this skill's to delete")
+        for path in ours:
+            self.assertFalse(path.exists(), f"{path.name} would be re-rendered later as if it were current")
+
     def test_report_patterns_track_the_name_the_search_tool_writes(self):
-        query = sa.SearchQuery(origin="SIN", destination="LHR", start_date=date(2026, 11, 14),
-                               end_date=date(2026, 11, 14), pax=2)
-        written = sa.default_report_path(query).name
+        written = sa.default_report_path(query(origin="SIN", destination="LHR")).name
         self.assertTrue(any(fnmatch.fnmatch(written, pattern) for pattern in pf.REPORT_PATTERNS),
                         f"{written} matches none of {pf.REPORT_PATTERNS}, so stale reports would survive")
 

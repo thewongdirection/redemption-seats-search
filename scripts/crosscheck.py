@@ -98,6 +98,7 @@ class CrossCheckSummary:
     entries: int = 0
     files: int = 0
     empty_files: int = 0     # queries FlightPoints answered with no availability
+    skipped_files: int = 0   # files in a cross-check directory that are not dumps this skill reads
     flight_matches: int = 0
     program_matches: int = 0
     price_disagreements: list[str] = field(default_factory=list)
@@ -112,6 +113,7 @@ class CrossCheckSummary:
     def to_json(self) -> dict[str, Any]:
         return {
             "provider": "flightpoints", "files": self.files, "entries": self.entries, "empty_files": self.empty_files,
+            "skipped_files": self.skipped_files,
             "flight_matches": self.flight_matches, "program_matches": self.program_matches,
             "price_disagreements": self.price_disagreements, "unmatched": self.unmatched,
             "out_of_scope": self.out_of_scope,
@@ -243,25 +245,34 @@ def parse_text(text: str) -> list[CrossCheckEntry]:
 
 
 # A directory of dumps holds .txt files (SKILL.md step 2b writes them that way), and only those are
-# read from one. preflight.py clears the same set, so what a search reads is what a preflight flushes;
-# widening either without the other leaves stale dumps that confirm rows from an older search.
+# read from one. preflight.py clears exactly this set, so what a search reads is what a preflight
+# flushes; widening either without the other leaves stale dumps that confirm rows from an older search.
 DUMP_SUFFIX = ".txt"
 
 
-def load_files(paths: Sequence[Path]) -> tuple[list[CrossCheckEntry], int, int]:
-    """Returns (entries, files read, files that were an explicit empty result).
+def is_dump(path: Path) -> bool:
+    """A cross-check dump this skill owns: a real file, not a symlink, named `*.txt` in any case."""
+    return path.is_file() and not path.is_symlink() and path.suffix.lower() == DUMP_SUFFIX
 
-    A path named directly is read whatever it is called; a directory contributes its `*.txt` dumps.
+
+def load_files(paths: Sequence[Path]) -> tuple[list[CrossCheckEntry], int, int, int]:
+    """Returns (entries, files read, files that were an explicit empty result, files skipped).
+
+    A path named directly is read whatever it is called; a directory contributes its dumps, and
+    counts anything else it holds as skipped so the caller can say so rather than read zero files
+    beside a directory that visibly has some.
     """
     entries: list[CrossCheckEntry] = []
-    files = empty = 0
+    files = empty = skipped = 0
     for path in paths:
         if path.is_dir():
-            sub = sorted(p for p in path.iterdir() if p.is_file() and p.suffix.lower() == DUMP_SUFFIX)
-            more, n, e = load_files(sub)
+            here = sorted(p for p in path.iterdir() if p.is_file())
+            skipped += sum(1 for p in here if not is_dump(p))
+            more, n, e, s = load_files([p for p in here if is_dump(p)])
             entries += more
             files += n
             empty += e
+            skipped += s
             continue
         files += 1
         text = path.read_text(encoding="utf-8", errors="replace")
@@ -269,7 +280,7 @@ def load_files(paths: Sequence[Path]) -> tuple[list[CrossCheckEntry], int, int]:
         entries += found
         if not found and (is_empty_result(text) or answered_without_premium_space(text)):
             empty += 1
-    return entries, files, empty
+    return entries, files, empty, skipped
 
 
 def entry_in_scope(entry: CrossCheckEntry, query: Any) -> bool:

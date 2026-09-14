@@ -27,8 +27,9 @@ It does three things a search must never skip:
    else's repository, a dirty tree, local commits, a missing git or an unreachable remote are all
    reported and left alone. If it says `updated`, the search you run next is already the new version -
    no restart needed.
-2. **Flushes stale data.** Reports, saved `--json` runs and cross-check dumps from earlier searches are
-   deleted (reports older than 12h, cross-check files older than 1h). Award space moves hourly: an old
+2. **Flushes stale data.** Reports, saved `--json` runs (`run.json`, or `run-<route>.json` when a session
+   compares several) and cross-check dumps from earlier searches are deleted (reports older than 12h,
+   cross-check files older than 1h). Award space moves hourly: an old
    report is not evidence about now, and an old cross-check file describes another search. Use
    `--flush-all` when the user is starting a fresh session of searching.
 3. **Proves the search can work.** python version, an API key, and one live call to seats.aero that
@@ -40,7 +41,7 @@ Read its exit code and act:
 | Exit | Meaning | What to do |
 |---|---|---|
 | 0 | ready | Search. Pass on any `warning` line that affects the answer (for example, a checkout that could not be updated). |
-| 2 | the user must fix something | No key, python too old, or a file it could not read or delete. Walk them through the matching row of the troubleshooting table in `SETUP.md`. Do not search. |
+| 2 | the user must fix something | No key, python too old, or something local it could not get past. Walk them through the matching row of the troubleshooting table in `SETUP.md`. Do not search. (A file it could not *delete* is only a flush warning, not this.) |
 | 3 | seats.aero refused or could not be reached | An expired key or membership, or no network. Say which, and do not spend quota trying searches that cannot work. |
 
 A `warning` on the `seats.aero` line means the key is fine but the API is busy: HTTP 429 is this

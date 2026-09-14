@@ -11,8 +11,9 @@ Three jobs, in this order:
 3. **Check** - python version, API key, and one live call to seats.aero to prove the key still works
    and the network is there, before any quota is spent on a real search.
 
-Exit codes: 0 ready to search, 2 something the user must fix (no key, python too old, a file that
-cannot be read or deleted), 3 seats.aero unreachable or the key rejected. Warnings never fail the run.
+Exit codes: 0 ready to search, 2 something local the user must fix (no key, python too old, a file
+this skill cannot read), 3 seats.aero unreachable or the key rejected. Warnings never fail the run,
+and a file that cannot be deleted is one of them.
 `ready` without `verified` means the key was never put to seats.aero, so a search may still fail on it.
 
     python3 scripts/preflight.py            # update, flush, check
@@ -22,6 +23,7 @@ cannot be read or deleted), 3 seats.aero unreachable or the key rejected. Warnin
 from __future__ import annotations
 
 import argparse
+import fnmatch
 import json
 import os
 import subprocess
@@ -31,7 +33,7 @@ import re
 from dataclasses import dataclass, field
 from datetime import date, timedelta
 from pathlib import Path
-from typing import Any, Sequence
+from typing import Any, Callable, Sequence
 
 _SCRIPT_DIR = str(Path(__file__).resolve().parent)
 if _SCRIPT_DIR not in sys.path:
@@ -45,15 +47,15 @@ GIT_TIMEOUT_SECONDS = 60.0
 BATCH_MODE = "-oBatchMode=yes"
 
 # What a search leaves behind, and how long any of it stays useful. Award space moves hourly, so a
-# report from this morning is not evidence about this afternoon. Only the two names this skill
-# actually writes: reports (sa.REPORT_GLOB owns that name) and the saved run SKILL.md step 5 dumps.
-REPORT_PATTERNS = (sa.REPORT_GLOB, "run.json")
+# report from this morning is not evidence about this afternoon. Only names this skill writes:
+# reports (sa.REPORT_GLOB owns that name) and the saved `--json` runs of SKILL.md step 5, which a
+# session comparing routes writes one per route.
+REPORT_PATTERNS = (sa.REPORT_GLOB, "run.json", "run-*.json", "run_*.json")
 DEFAULT_MAX_AGE_HOURS = 12.0
 # Cross-check dumps are scratch for one search: a file naming another route or date can only mislead
-# the next one, so they expire fast. The pattern is crosscheck.DUMP_SUFFIX, the same set a search
-# reads out of that directory - so nothing survives a flush only to confirm a row in the next search.
+# the next one, so they expire fast. What counts as a dump is crosscheck.is_dump - the same test a
+# search reads by - so nothing survives a flush only to confirm a row in the next search.
 CROSSCHECK_DIR = "crosscheck"
-CROSSCHECK_PATTERNS = (f"*{crosscheck.DUMP_SUFFIX}",)
 DEFAULT_CROSSCHECK_MAX_AGE_MINUTES = 60.0
 
 # The cheapest authenticated call that proves a key: one cached-search page, one row.
@@ -113,9 +115,24 @@ def git_env() -> dict[str, str]:
     env["GIT_TERMINAL_PROMPT"] = "0"
     env.setdefault("GIT_ASKPASS", "echo")            # unset would mean "ask the terminal"
     env.setdefault("SSH_ASKPASS", "echo")
-    ssh = env.get("GIT_SSH_COMMAND", "ssh")
-    env["GIT_SSH_COMMAND"] = ssh if BATCH_MODE in ssh else f"{ssh} {BATCH_MODE}"
+    env["GIT_SSH_COMMAND"] = _batch_ssh(env.get("GIT_SSH_COMMAND", "ssh"))
     return env
+
+
+def _batch_ssh(command: str) -> str:
+    """`command` with batch mode asked for first, when it is an ssh we recognise.
+
+    ssh honours the FIRST value given for an option, so appending loses to a `-oBatchMode=no` the
+    user already set; the flag goes straight after the program name instead. A command that is not
+    OpenSSH (plink, a wrapper script) would reject the flag outright, so it is left exactly as it is
+    - a fetch that needs a passphrase then fails on the timeout, which is already only a warning.
+    """
+    program, _, rest = command.strip().partition(" ")
+    if Path(program).name not in {"ssh", "ssh.exe"}:
+        return command
+    # Spliced, not rebuilt: git runs this through a shell, so re-quoting the rest would stop a
+    # `~` in the user's `-i ~/.ssh/id` from expanding.
+    return f"{program} {BATCH_MODE} {rest}".strip()
 
 
 def git(args: Sequence[str], root: Path) -> subprocess.CompletedProcess[str]:
@@ -161,7 +178,8 @@ def update_skill(root: Path, report: Report, offline: bool = False) -> None:
         report.add("update", "skipped", f"cannot read a remote branch from {tracking!r}")
         return
 
-    fetch = git(["fetch", "--quiet", remote, branch], root)
+    # `--` so a refname that legally starts with a dash can never read as an option to fetch.
+    fetch = git(["fetch", "--quiet", remote, "--", branch], root)
     if fetch.returncode != 0:
         report.add("update", "warning", f"could not reach {remote} ({_first_line(fetch.stderr)}); running the version already here")
         return
@@ -214,9 +232,12 @@ def _short_sha(root: Path) -> str:
 def _two_counts(text: str) -> tuple[int, int] | None:
     """The (ahead, behind) pair from `rev-list --left-right --count`, or None if that is not what came back."""
     fields = (text or "").split()
-    if len(fields) != 2 or not all(f.lstrip("-").isdigit() for f in fields):
+    if len(fields) != 2:
         return None
-    return int(fields[0]), int(fields[1])
+    try:
+        return int(fields[0]), int(fields[1])
+    except ValueError:      # a warning or advice line where two numbers belong
+        return None
 
 
 def _first_line(text: str) -> str:
@@ -236,11 +257,13 @@ def flush_stale_data(report_dir: Path, report: Report, max_age_hours: float, cro
 
     now = time.time()
     removed, kept, freed = [], [], 0
-    stale = [(path, path.name) for path in _expired(report_dir, REPORT_PATTERNS, now, max_age_hours * 3600, flush_all)]
-    crosscheck = report_dir / CROSSCHECK_DIR
-    if crosscheck.is_dir() and not crosscheck.is_symlink():
+    stale = [(path, path.name)
+             for path in _expired(report_dir, _matches_report, now, max_age_hours * 3600, flush_all)]
+    crosscheck_dir = report_dir / CROSSCHECK_DIR        # not `crosscheck`: that is the module
+    if crosscheck_dir.is_dir():                         # _expired refuses it if it is a symlink
         stale += [(path, f"{CROSSCHECK_DIR}/{path.name}")
-                  for path in _expired(crosscheck, CROSSCHECK_PATTERNS, now, crosscheck_max_age_minutes * 60, flush_all)]
+                  for path in _expired(crosscheck_dir, crosscheck.is_dump, now,
+                                       crosscheck_max_age_minutes * 60, flush_all)]
     for path, label in stale:
         try:
             size = path.stat().st_size
@@ -271,23 +294,33 @@ def _shorten(names: Sequence[str], keep: int = 4) -> str:
     return ", ".join(names[:keep]) + (f" and {len(names) - keep} more" if len(names) > keep else "")
 
 
-def _expired(directory: Path, patterns: Sequence[str], now: float, max_age_seconds: float, flush_all: bool) -> list[Path]:
-    """Files under `directory` (never below it, never elsewhere) older than the cutoff."""
+def _matches_report(path: Path) -> bool:
+    """A report or saved run this skill wrote, by the names search_awards gives them."""
+    return any(fnmatch.fnmatch(path.name, pattern) for pattern in REPORT_PATTERNS)
+
+
+def _expired(directory: Path, ours: Callable[[Path], bool], now: float, max_age_seconds: float,
+             flush_all: bool) -> list[Path]:
+    """Files directly in `directory` (never below it, never elsewhere) that are ours and past the cutoff."""
     if directory.is_symlink():
         # Resolving a symlinked directory would move the "never elsewhere" fence with it, so the
         # guard below would happily pass files in whatever it points at.
         return []
     directory = directory.resolve()
-    found: dict[Path, None] = {}
-    for pattern in patterns:
-        for path in directory.glob(pattern):
-            if not path.is_file() or path.is_symlink():
+    found = []
+    for path in sorted(directory.iterdir()):
+        try:
+            if not path.is_file() or path.is_symlink() or not ours(path):
                 continue
-            if path.resolve().parent != directory:      # refuse anything a glob walked outside
+            if path.resolve().parent != directory:      # refuse anything that leads outside
                 continue
             if flush_all or now - path.stat().st_mtime > max_age_seconds:
-                found[path] = None
-    return list(found)
+                found.append(path)
+        except OSError:
+            # Another session deleted it between the listing and the question. Nothing to clear,
+            # and certainly not a reason to refuse a search.
+            continue
+    return found
 
 
 # --------------------------------------------------------------------------- 3. check
@@ -331,10 +364,12 @@ def check_seats_aero(key: str, report: Report, timeout: float = 30.0) -> None:
         if "rejected the API key" in detail:
             report.fail("seats.aero", f"{detail} Nothing was searched.", 3)
         elif code == 429:
-            report.verified = True          # rate limiting is applied to a recognised account
+            # Not proof of a good key: a rate limit can be applied at the edge before the key is
+            # ever authenticated, so a revoked key can answer 429 too.
+            report.unverified = "seats.aero was rate-limiting (HTTP 429) before the key could be checked"
             report.add("seats.aero", "warning",
-                       "the key is accepted but seats.aero is rate-limiting this account right now "
-                       "(HTTP 429). The daily quota may be spent; a search may fail or return cached data only.")
+                       "seats.aero is rate-limiting right now (HTTP 429), so the key could not be checked. "
+                       "The daily quota may be spent; a search may fail or return cached data only.")
         elif code >= 500:
             report.unverified = f"seats.aero returned {code}"
             report.add("seats.aero", "warning",
@@ -364,11 +399,12 @@ def run(args: argparse.Namespace) -> Report:
     report = Report()
     try:
         _run_steps(args, report)
-    except OSError as err:
-        # A file this skill cannot read, write or delete: the user's to fix (exit 2), never exit 3,
-        # which SKILL.md defines as seats.aero refusing. Steps already taken stay in the report, so
-        # their warnings still reach the caller.
-        report.fail("preflight", f"preflight could not finish: {err}", 2)
+    except Exception as err:                             # noqa: BLE001 - the contract is no tracebacks
+        # Something local this skill cannot get past: a file it cannot read, a key file in an
+        # encoding it cannot decode. The user's to fix (exit 2), never exit 3, which SKILL.md
+        # defines as seats.aero refusing. Steps already taken stay in the report, so their warnings
+        # still reach the caller, and --json still gets JSON.
+        report.fail("preflight", f"preflight could not finish: {type(err).__name__}: {err}", 2)
     return report
 
 

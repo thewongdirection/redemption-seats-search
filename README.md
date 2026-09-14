@@ -107,9 +107,12 @@ only), clears reports and cross-check files left over from earlier searches, and
 works with one live call to seats.aero. Exit 0 ready, 2 fix something (no key, python too old, a file
 it could not read or delete), 3 seats.aero refused or unreachable.
 
-It deletes only what this skill writes: `awards_*.html` reports and a saved `run.json` in the report
-directory, and `*.txt` dumps in `crosscheck/` beneath it. Anything else parked in those folders, and
-anything reached through a symlink, is left alone.
+It deletes only what this skill writes: `awards_*.html` reports and saved runs (`run.json`,
+`run-*.json`, `run_*.json`) in the report directory, and `*.txt` dumps in `crosscheck/` beneath it -
+exactly the set `--cross-check` reads back, so nothing survives a flush only to confirm a row in a
+later search. Anything else parked in those folders is left alone, as is any file that is a symlink
+and anything under a `crosscheck/` that is one. The report directory itself is followed if it is a
+symlink, because that is where the reports were written.
 
 | Option | Effect |
 |---|---|
@@ -213,7 +216,7 @@ drive a seats.aero MCP server.
 ## Development
 
 ```bash
-./run_tests.sh              # 186 offline unit tests, network mocked
+./run_tests.sh              # 198 offline unit tests, network mocked
 ./scripts/check_secrets.sh  # credential scan
 ```
 

@@ -984,7 +984,7 @@ def apply_cross_check(result: SearchResult, paths: Sequence[Path], log: Callable
     """Match FlightPoints output files against the seats.aero rows and regroup the report."""
     # A --load run may already carry notes from an earlier cross-check; this one supersedes them.
     result.notes = [n for n in result.notes if not any(m in n for m in CROSS_CHECK_NOTE_MARKERS)]
-    entries, files, empty_files = crosscheck.load_files(list(paths))
+    entries, files, empty_files, skipped_files = crosscheck.load_files(list(paths))
     before = len(entries)
     entries = [e for e in entries if crosscheck.entry_in_scope(e, result.query)]
     if len(entries) < before:
@@ -993,6 +993,7 @@ def apply_cross_check(result: SearchResult, paths: Sequence[Path], log: Callable
     summary.out_of_scope = before - len(entries)
     summary.files = files
     summary.empty_files = empty_files
+    summary.skipped_files = skipped_files
     result.crosscheck = summary
     sort_options(result.options)
     confirmed = summary.flight_matches + summary.program_matches
@@ -1005,7 +1006,11 @@ def apply_cross_check(result: SearchResult, paths: Sequence[Path], log: Callable
             result.notes.insert(0, f"FlightPoints was queried ({files} searches) and reported no business or first space on this route and date(s), "
                                    "so none of these rows is confirmed by a second source. Treat them as seats.aero-only until you check the program's site.")
         else:
-            result.notes.insert(0, f"Cross-check requested but no FlightPoints entries could be read from {files} file(s); rows are seats.aero only.")
+            note = f"Cross-check requested but no FlightPoints entries could be read from {files} file(s); rows are seats.aero only."
+            if skipped_files:
+                note += (f" {skipped_files} file(s) in the cross-check directory were not read: a directory contributes "
+                         f"its {crosscheck.DUMP_SUFFIX} dumps, so save FlightPoints output with that extension, or name the file directly.")
+            result.notes.insert(0, note)
         return
     note = (f"Cross-checked against FlightPoints ({len(entries)} entries): {confirmed} of {len(result.options)} rows confirmed by both sources"
             f" ({summary.flight_matches} by exact flight, {summary.program_matches} by program and price) and grouped at the top.")
@@ -1043,6 +1048,7 @@ def load_result(path: Path) -> SearchResult:
         c = payload["crosscheck"]
         cross = crosscheck.CrossCheckSummary(
             entries=int(c.get("entries", 0)), files=int(c.get("files", 0)), empty_files=int(c.get("empty_files", 0)),
+            skipped_files=int(c.get("skipped_files", 0)),
             flight_matches=int(c.get("flight_matches", 0)), program_matches=int(c.get("program_matches", 0)),
             price_disagreements=list(c.get("price_disagreements") or []), unmatched=list(c.get("unmatched") or []),
             out_of_scope=int(c.get("out_of_scope", 0)),
