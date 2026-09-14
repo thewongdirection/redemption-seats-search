@@ -242,13 +242,22 @@ def parse_text(text: str) -> list[CrossCheckEntry]:
     return []
 
 
+# A directory of dumps holds .txt files (SKILL.md step 2b writes them that way), and only those are
+# read from one. preflight.py clears the same set, so what a search reads is what a preflight flushes;
+# widening either without the other leaves stale dumps that confirm rows from an older search.
+DUMP_SUFFIX = ".txt"
+
+
 def load_files(paths: Sequence[Path]) -> tuple[list[CrossCheckEntry], int, int]:
-    """Returns (entries, files read, files that were an explicit empty result)."""
+    """Returns (entries, files read, files that were an explicit empty result).
+
+    A path named directly is read whatever it is called; a directory contributes its `*.txt` dumps.
+    """
     entries: list[CrossCheckEntry] = []
     files = empty = 0
     for path in paths:
         if path.is_dir():
-            sub = sorted(p for p in path.iterdir() if p.is_file())
+            sub = sorted(p for p in path.iterdir() if p.is_file() and p.suffix.lower() == DUMP_SUFFIX)
             more, n, e = load_files(sub)
             entries += more
             files += n

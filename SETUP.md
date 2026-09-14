@@ -85,17 +85,16 @@ Run the preflight first - it checks the key, the network and your python in one 
 exactly which of them is wrong if something is:
 
 ```bash
-cd ~/travel            # or wherever you want reports written
-python3 ~/.claude/skills/redemption-seats-search/scripts/preflight.py
+cd ~/redemption-seats-search      # the skill root: run preflight and searches from the same place
+python3 scripts/preflight.py
 ```
 
 It also updates the skill to the newest version and clears stale reports, which is what it does before
-every search from then on. Run it from the directory you run searches in: reports are written to
-`award-reports/` beneath the current directory, and that is the one it clears (the line it prints names
-the directory, so a run from the wrong place is obvious).
+every search from then on. Run it from the directory you run searches in, so that the `award-reports/`
+it clears is the one they write to (the line it prints names that directory, so a run from the wrong
+place is obvious).
 
 ```bash
-cd ~/redemption-seats-search
 ./run_tests.sh                                                  # offline; should end with "OK"
 python3 scripts/search_awards.py SIN LHR --pax 1 --no-refresh   # live, cached data only, costs 1-10 calls
 ```

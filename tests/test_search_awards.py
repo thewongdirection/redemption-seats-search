@@ -6,6 +6,7 @@ run offline and never need a real API key.
 from __future__ import annotations
 
 import contextlib
+import fnmatch
 import io
 import json
 import os
@@ -25,6 +26,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "scripts"))
 sys.path.insert(0, str(ROOT / "tests"))
 
+import crosscheck  # noqa: E402
 import preflight as pf  # noqa: E402
 import search_awards as sa  # noqa: E402
 
@@ -1711,10 +1713,16 @@ class PreflightFlushTests(unittest.TestCase):
 
 
 class PreflightCheckTests(unittest.TestCase):
-    def client_factory(self, opener: FakeOpener, **client_kw):
-        """Hand preflight a client wired to a fake opener, without the patched name recursing."""
+    def client_factory(self, opener: FakeOpener, **overrides):
+        """Hand preflight a client wired to a fake opener, without the patched name recursing.
+
+        Whatever preflight passes (timeout, max_retries) is forwarded, so the tests exercise the
+        real call; `overrides` only wins where a test deliberately sets something else.
+        """
         real = sa.SeatsAeroClient
-        return lambda key, **kw: real(key, opener=opener, sleep=lambda _seconds: None, **client_kw)
+        def build(key, **kw):
+            return real(key, opener=opener, sleep=lambda _seconds: None, **{**kw, **overrides})
+        return build
 
     def key_file(self, value: str = "test-key") -> Path:
         path = Path(tempfile.mkdtemp()) / "api_key"
@@ -1769,11 +1777,16 @@ class PreflightCheckTests(unittest.TestCase):
 
     def test_connector_and_freshness_reminders_are_always_present(self):
         report = pf.Report()
-        pf.note_connectors(report)
-        pf.note_freshness(report)
+        pf.note_checks_this_script_cannot_make(report)
         details = " ".join(s["detail"] for s in report.steps)
         self.assertIn("FlightPoints", details)
         self.assertIn("--no-refresh", details)
+
+    def test_the_reminders_are_notes_not_checks_that_passed(self):
+        report = pf.Report()
+        pf.note_checks_this_script_cannot_make(report)
+        self.assertEqual({s["status"] for s in report.steps}, {"note"},
+                         "nothing was verified here, so these must not read as passing checks")
 
 
 class PreflightCommandTests(unittest.TestCase):
@@ -1788,8 +1801,20 @@ class PreflightCommandTests(unittest.TestCase):
         payload = json.loads(out.getvalue())
         self.assertEqual(code, 0)
         self.assertTrue(payload["ready"])
+        self.assertFalse(payload["verified"], "--offline never put the key to seats.aero")
         self.assertEqual({s["step"] for s in payload["steps"]},
                          {"update", "flush", "python", "api key", "seats.aero", "connectors", "freshness"})
+
+    def test_an_offline_run_says_the_key_was_never_checked(self):
+        out = io.StringIO()
+        key = Path(tempfile.mkdtemp()) / "api_key"
+        key.write_text("test-key")
+        key.chmod(0o600)
+        with mock.patch.object(sa, "API_KEY_FILE", key), mock.patch.dict(os.environ, {"SEATS_AERO_API_KEY": ""}, clear=False), \
+             contextlib.redirect_stdout(out):
+            code = pf.main(["--offline", "--no-flush"])
+        self.assertEqual(code, 0)
+        self.assertIn("never checked against seats.aero", out.getvalue())
 
     def test_a_blocked_run_says_so_and_exits_nonzero(self):
         out = io.StringIO()
@@ -1801,7 +1826,7 @@ class PreflightCommandTests(unittest.TestCase):
 
 
 class PreflightSafetyTests(unittest.TestCase):
-    """The review found these six; each one stays fixed."""
+    """Every case a review found in the preflight; each one stays fixed."""
 
     def setUp(self):
         self.tmp = Path(tempfile.mkdtemp())
@@ -1896,6 +1921,172 @@ class PreflightSafetyTests(unittest.TestCase):
         pf.flush_stale_data(reports, report, 12, 60)
         self.assertEqual(report.steps[0]["directory"], str(reports.resolve()))
         self.assertIn(str(reports.resolve()), report.steps[0]["detail"])
+
+    def test_a_symlinked_crosscheck_directory_is_left_alone(self):
+        reports = self.tmp / "award-reports"
+        reports.mkdir()
+        elsewhere = self.tmp / "documents"
+        elsewhere.mkdir()
+        theirs = elsewhere / "taxes.txt"           # nothing to do with this skill
+        theirs.write_text("keep me")
+        os.utime(theirs, (0, 0))
+        (reports / pf.CROSSCHECK_DIR).symlink_to(elsewhere, target_is_directory=True)
+
+        report = pf.Report()
+        pf.flush_stale_data(reports, report, 12, 60, flush_all=True)
+        self.assertTrue(theirs.exists(), "a symlinked crosscheck folder must not widen the blast radius")
+        self.assertEqual(report.exit_code, 0)
+
+    def test_the_crosscheck_flush_only_takes_the_dumps_this_skill_writes(self):
+        crosscheck = self.tmp / "award-reports" / pf.CROSSCHECK_DIR
+        crosscheck.mkdir(parents=True)
+        theirs = crosscheck / "my-personal-notes.md"
+        theirs.write_text("keep me")
+        os.utime(theirs, (0, 0))
+        ours = crosscheck / "search-SIN-HND-business.txt"
+        ours.write_text("FlightPoints output")
+        os.utime(ours, (0, 0))
+
+        report = pf.Report()
+        pf.flush_stale_data(self.tmp / "award-reports", report, 12, 60)
+        self.assertTrue(theirs.exists(), "only .txt dumps in this folder are this skill's")
+        self.assertFalse(ours.exists())
+
+    def test_a_file_that_cannot_be_deleted_is_the_users_to_fix_not_a_dead_api(self):
+        out = io.StringIO()
+        with mock.patch.object(pf, "flush_stale_data", side_effect=PermissionError("[Errno 13] Permission denied")), \
+             contextlib.redirect_stdout(out):
+            code = pf.main(["--offline", "--json"])
+        payload = json.loads(out.getvalue())     # must stay parseable: --json promises JSON
+        self.assertEqual(code, 2, "exit 3 would tell the user their key expired")
+        self.assertFalse(payload["ready"])
+        self.assertIn("Permission denied", payload["blocked"])
+
+    @unittest.skipUnless(shutil.which("git"), "git is not installed")
+    def test_a_hanging_fetch_is_a_warning_not_a_dead_search(self):
+        """A blackholed network makes fetch hang rather than fail; the search must still go ahead."""
+        _origin, clone = make_checkout(self.tmp)
+        report = pf.Report()
+        real = pf.subprocess.run
+
+        def hang(cmd, *args, **kw):
+            if "fetch" in cmd:
+                raise subprocess.TimeoutExpired(cmd, pf.GIT_TIMEOUT_SECONDS)
+            return real(cmd, *args, **kw)
+
+        with mock.patch.object(pf.subprocess, "run", side_effect=hang):
+            pf.update_skill(clone, report)
+        step = next(s for s in report.steps if s["step"] == "update")
+        self.assertEqual(step["status"], "warning")
+        self.assertIn("did not answer", step["detail"])
+        self.assertEqual(report.exit_code, 0, "a failed update must never stop a search")
+
+    def test_git_is_never_allowed_to_prompt(self):
+        seen = {}
+
+        def record(cmd, *args, **kw):
+            seen.update(kw)
+            return subprocess.CompletedProcess(cmd, 0, "", "")
+
+        with mock.patch.object(pf.subprocess, "run", side_effect=record):
+            pf.git(["status"], self.tmp)
+        self.assertEqual(seen["env"]["GIT_TERMINAL_PROMPT"], "0")
+        self.assertEqual(seen["stdin"], subprocess.DEVNULL, "an unattended run must not wait on a password")
+
+    @unittest.skipUnless(shutil.which("git"), "git is not installed")
+    def test_a_status_that_fails_is_not_read_as_a_clean_tree(self):
+        origin, clone = make_checkout(self.tmp)
+        (origin / "SKILL.md").write_text("v2\n")
+        git(["add", "-A"], origin)
+        git(["commit", "--quiet", "-m", "second"], origin)
+        real = pf.git
+
+        def fail_status(args, root):
+            if args[0] == "status":
+                return subprocess.CompletedProcess(args, 128, "", "fatal: unable to read index.lock")
+            return real(args, root)
+
+        report = pf.Report()
+        with mock.patch.object(pf, "git", side_effect=fail_status):
+            pf.update_skill(clone, report)
+        step = next(s for s in report.steps if s["step"] == "update")
+        self.assertEqual(step["status"], "warning")
+        self.assertEqual((clone / "SKILL.md").read_text(), "v1\n", "an unknown tree state must not be merged over")
+
+    def test_unreadable_rev_list_output_warns_instead_of_raising(self):
+        self.assertIsNone(pf._two_counts("warning: refname is ambiguous\n0\t2\n"))
+        self.assertIsNone(pf._two_counts(""))
+        self.assertEqual(pf._two_counts("0\t2\n"), (0, 2))
+
+    def test_the_probe_asks_for_no_retries(self):
+        seen = {}
+        opener = FakeOpener({"search": {"data": [], "hasMore": False, "cursor": 0}})
+        real = sa.SeatsAeroClient
+
+        def factory(key, **kw):
+            seen.update(kw)
+            return real(key, opener=opener, sleep=lambda _s: None, **kw)
+
+        with mock.patch.object(sa, "SeatsAeroClient", factory):
+            pf.check_seats_aero("test-key", pf.Report())
+        self.assertEqual(seen["max_retries"], 0, "a preflight must answer now, not wait out a Retry-After")
+
+    def test_the_flush_and_the_cross_check_agree_on_what_a_dump_is(self):
+        """Anything a search would read out of crosscheck/ is something a flush must be able to clear."""
+        crosscheck_dir = self.tmp / "award-reports" / pf.CROSSCHECK_DIR
+        crosscheck_dir.mkdir(parents=True)
+        for name in ("search-SIN-HND.txt", "notes.md", "dump.json"):
+            (crosscheck_dir / name).write_text("Premium cabins\n")
+        read = {path.name for path in sorted(crosscheck_dir.iterdir())
+                if any(fnmatch.fnmatch(path.name, pattern) for pattern in pf.CROSSCHECK_PATTERNS)}
+        _entries, files, _empty = crosscheck.load_files([crosscheck_dir])
+        self.assertEqual(files, len(read), "a search must read exactly the set a flush can clear")
+
+    def test_a_file_that_vanishes_mid_flush_is_a_warning_not_a_dead_search(self):
+        reports = self.tmp / "award-reports"
+        reports.mkdir()
+        stale = reports / "awards_SIN-LHR_2026-11-14_pax2.html"
+        stale.write_text("x")
+        os.utime(stale, (0, 0))
+        report = pf.Report()
+        with mock.patch.object(Path, "unlink", side_effect=FileNotFoundError("gone")):
+            pf.flush_stale_data(reports, report, 12, 60)
+        self.assertEqual(report.steps[0]["status"], "warning")
+        self.assertEqual(report.exit_code, 0, "another session tidying up must not block this search")
+
+    def test_a_broken_filesystem_keeps_the_steps_already_taken(self):
+        out = io.StringIO()
+        with mock.patch.object(pf, "check_python", side_effect=PermissionError("[Errno 13] Permission denied")), \
+             contextlib.redirect_stdout(out):
+            code = pf.main(["--offline", "--no-update", "--no-flush", "--json"])
+        payload = json.loads(out.getvalue())
+        self.assertEqual(code, 2)
+        self.assertIn("update", [s["step"] for s in payload["steps"]], "earlier steps and their warnings survive")
+        self.assertEqual(payload["steps"][-1]["status"], "blocked")
+
+    def test_a_server_error_does_not_blame_offline_for_the_unchecked_key(self):
+        report = pf.Report()
+        opener = FakeOpener({"search": http_error("https://seats.aero/partnerapi/search", 503, "maintenance")})
+        real = sa.SeatsAeroClient
+        with mock.patch.object(sa, "SeatsAeroClient", lambda key, **kw: real(key, opener=opener, sleep=lambda _s: None, **kw)):
+            pf.check_seats_aero("test-key", report)
+        self.assertFalse(report.verified)
+        self.assertIn("503", report.unverified)
+        self.assertNotIn("--offline", report.to_text())
+
+    def test_the_users_own_ssh_command_survives_batch_mode(self):
+        with mock.patch.dict(os.environ, {"GIT_SSH_COMMAND": "ssh -i ~/.ssh/work_key"}, clear=False):
+            env = pf.git_env()
+        self.assertIn("-i ~/.ssh/work_key", env["GIT_SSH_COMMAND"], "the identity the remote needs must be kept")
+        self.assertIn(pf.BATCH_MODE, env["GIT_SSH_COMMAND"])
+        self.assertEqual(env["GIT_TERMINAL_PROMPT"], "0")
+
+    def test_report_patterns_track_the_name_the_search_tool_writes(self):
+        query = sa.SearchQuery(origin="SIN", destination="LHR", start_date=date(2026, 11, 14),
+                               end_date=date(2026, 11, 14), pax=2)
+        written = sa.default_report_path(query).name
+        self.assertTrue(any(fnmatch.fnmatch(written, pattern) for pattern in pf.REPORT_PATTERNS),
+                        f"{written} matches none of {pf.REPORT_PATTERNS}, so stale reports would survive")
 
 
 if __name__ == "__main__":

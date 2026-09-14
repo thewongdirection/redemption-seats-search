@@ -40,7 +40,7 @@ Read its exit code and act:
 | Exit | Meaning | What to do |
 |---|---|---|
 | 0 | ready | Search. Pass on any `warning` line that affects the answer (for example, a checkout that could not be updated). |
-| 2 | the user must fix something | No key, or python too old. Walk them through the matching row of the troubleshooting table in `SETUP.md`. Do not search. |
+| 2 | the user must fix something | No key, python too old, or a file it could not read or delete. Walk them through the matching row of the troubleshooting table in `SETUP.md`. Do not search. |
 | 3 | seats.aero refused or could not be reached | An expired key or membership, or no network. Say which, and do not spend quota trying searches that cannot work. |
 
 A `warning` on the `seats.aero` line means the key is fine but the API is busy: HTTP 429 is this
@@ -56,8 +56,14 @@ Two checks the script cannot make, so make them yourself before searching:
   first. Reach for cached data only when the user asks for it or the quota is nearly spent, and when you
   do, say so in the reply next to the numbers.
 
-`--offline` skips the fetch and the live call when there is genuinely no network; `--no-update` and
-`--no-flush` exist for debugging and should not be used in a normal search.
+`--offline` skips the fetch and the live call when there is genuinely no network. It still exits 0, but
+the last line says the key was never checked and `--json` reports `"verified": false` - treat that as
+"probably fine", not as proof, and if the first search then fails on the key, say that is what happened.
+`--no-update` and `--no-flush` exist for debugging and should not be used in a normal search.
+
+Run it from the skill root, the same directory you run `scripts/search_awards.py` from: the reports it
+clears are the ones that search writes, both under `award-reports/` beneath the current directory. The
+line it prints names that directory, so a run from the wrong place is obvious.
 
 ## 1. Collect the inputs
 

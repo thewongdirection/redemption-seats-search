@@ -104,17 +104,21 @@ python3 scripts/preflight.py
 
 Updates this skill to the newest version its git remote offers (clean checkouts only, fast-forward
 only), clears reports and cross-check files left over from earlier searches, and proves the key still
-works with one live call to seats.aero. Exit 0 ready, 2 fix something (no key, python too old), 3
-seats.aero refused or unreachable.
+works with one live call to seats.aero. Exit 0 ready, 2 fix something (no key, python too old, a file
+it could not read or delete), 3 seats.aero refused or unreachable.
+
+It deletes only what this skill writes: `awards_*.html` reports and a saved `run.json` in the report
+directory, and `*.txt` dumps in `crosscheck/` beneath it. Anything else parked in those folders, and
+anything reached through a symlink, is left alone.
 
 | Option | Effect |
 |---|---|
 | `--flush-all` | Clear every report and cross-check file, whatever its age |
 | `--max-age-hours N` | How old a report may be before it is cleared. Default 12 |
 | `--crosscheck-max-age-minutes N` | Same for cross-check dumps. Default 60 |
-| `--offline` | Skip the remote fetch and the live API call |
+| `--offline` | Skip the remote fetch and the live API call. Still exits 0, but reports `"verified": false` - the key was never put to the API |
 | `--no-update` / `--no-flush` | Leave the checkout or the old files alone (debugging) |
-| `--json` | Machine-readable report |
+| `--json` | Machine-readable report: `ready`, `verified`, `exit_code`, `blocked`, `steps` |
 
 ## Use it
 
@@ -209,7 +213,7 @@ drive a seats.aero MCP server.
 ## Development
 
 ```bash
-./run_tests.sh              # 175 offline unit tests, network mocked
+./run_tests.sh              # 186 offline unit tests, network mocked
 ./scripts/check_secrets.sh  # credential scan
 ```
 

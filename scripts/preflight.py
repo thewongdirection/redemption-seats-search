@@ -11,8 +11,9 @@ Three jobs, in this order:
 3. **Check** - python version, API key, and one live call to seats.aero to prove the key still works
    and the network is there, before any quota is spent on a real search.
 
-Exit codes: 0 ready to search, 2 something the user must fix (no key, python too old),
-3 seats.aero unreachable or the key rejected. Warnings never fail the run.
+Exit codes: 0 ready to search, 2 something the user must fix (no key, python too old, a file that
+cannot be read or deleted), 3 seats.aero unreachable or the key rejected. Warnings never fail the run.
+`ready` without `verified` means the key was never put to seats.aero, so a search may still fail on it.
 
     python3 scripts/preflight.py            # update, flush, check
     python3 scripts/preflight.py --json     # same, machine-readable
@@ -35,19 +36,24 @@ from typing import Any, Sequence
 _SCRIPT_DIR = str(Path(__file__).resolve().parent)
 if _SCRIPT_DIR not in sys.path:
     sys.path.append(_SCRIPT_DIR)   # append, so a caller's own modules keep priority
+import crosscheck  # noqa: E402  (sibling module: it owns what a cross-check dump is called)
 import search_awards as sa  # noqa: E402  (sibling module: the search tool itself)
 
 SKILL_ROOT = Path(__file__).resolve().parent.parent
 MIN_PYTHON = (3, 9)
 GIT_TIMEOUT_SECONDS = 60.0
+BATCH_MODE = "-oBatchMode=yes"
 
 # What a search leaves behind, and how long any of it stays useful. Award space moves hourly, so a
-# report from this morning is not evidence about this afternoon.
-REPORT_PATTERNS = ("awards_*.html", "awards_*.json", "run.json", "run-*.json", "run_*.json")
+# report from this morning is not evidence about this afternoon. Only the two names this skill
+# actually writes: reports (sa.REPORT_GLOB owns that name) and the saved run SKILL.md step 5 dumps.
+REPORT_PATTERNS = (sa.REPORT_GLOB, "run.json")
 DEFAULT_MAX_AGE_HOURS = 12.0
 # Cross-check dumps are scratch for one search: a file naming another route or date can only mislead
-# the next one, so they expire fast.
+# the next one, so they expire fast. The pattern is crosscheck.DUMP_SUFFIX, the same set a search
+# reads out of that directory - so nothing survives a flush only to confirm a row in the next search.
 CROSSCHECK_DIR = "crosscheck"
+CROSSCHECK_PATTERNS = (f"*{crosscheck.DUMP_SUFFIX}",)
 DEFAULT_CROSSCHECK_MAX_AGE_MINUTES = 60.0
 
 # The cheapest authenticated call that proves a key: one cached-search page, one row.
@@ -62,6 +68,8 @@ class Report:
     steps: list[dict[str, Any]] = field(default_factory=list)
     blocked: str = ""          # set when the search cannot run at all
     exit_code: int = 0
+    verified: bool = False     # True only once seats.aero has answered this key, live
+    unverified: str = ""       # why not, in the words the closing line should use
 
     def add(self, step: str, status: str, detail: str, **extra: Any) -> None:
         self.steps.append({"step": step, "status": status, "detail": detail, **extra})
@@ -72,24 +80,55 @@ class Report:
         self.exit_code = exit_code
 
     def to_json(self) -> dict[str, Any]:
-        return {"ready": self.exit_code == 0, "exit_code": self.exit_code, "blocked": self.blocked, "steps": self.steps}
+        return {"ready": self.exit_code == 0, "verified": self.verified, "unverified": self.unverified,
+                "exit_code": self.exit_code, "blocked": self.blocked, "steps": self.steps}
 
     def to_text(self) -> str:
-        marks = {"ok": "ok", "updated": "updated", "skipped": "skipped", "warning": "warning", "blocked": "BLOCKED"}
+        marks = {"ok": "ok", "updated": "updated", "skipped": "skipped",
+                 "note": "note", "warning": "warning", "blocked": "BLOCKED"}
         lines = [f"{marks.get(s['status'], s['status']):>8}  {s['step']}: {s['detail']}" for s in self.steps]
         lines.append("")
-        lines.append("ready to search" if self.exit_code == 0 else f"cannot search: {self.blocked}")
+        if self.exit_code:
+            lines.append(f"cannot search: {self.blocked}")
+        elif self.verified:
+            lines.append("ready to search")
+        else:
+            lines.append("ready to search, but the key was never checked against seats.aero "
+                         f"({self.unverified or 'not checked'}), "
+                         "so a search may still fail on it")
         return "\n".join(lines)
 
 
 # --------------------------------------------------------------------------- 1. update
 
 
+def git_env() -> dict[str, str]:
+    """The caller's environment, with prompting turned off.
+
+    A preflight runs unattended, so git must fail rather than stop for a password or a key
+    passphrase. Whatever the user configured still wins: their askpass helper and their ssh command
+    (which may carry the identity the remote needs) are kept, only extended with batch mode.
+    """
+    env = dict(os.environ)
+    env["GIT_TERMINAL_PROMPT"] = "0"
+    env.setdefault("GIT_ASKPASS", "echo")            # unset would mean "ask the terminal"
+    env.setdefault("SSH_ASKPASS", "echo")
+    ssh = env.get("GIT_SSH_COMMAND", "ssh")
+    env["GIT_SSH_COMMAND"] = ssh if BATCH_MODE in ssh else f"{ssh} {BATCH_MODE}"
+    return env
+
+
 def git(args: Sequence[str], root: Path) -> subprocess.CompletedProcess[str]:
+    """Run one git command. Never prompts, never hangs, never raises: failures come back as a returncode."""
     try:
-        return subprocess.run(["git", "-C", str(root), *args], capture_output=True, text=True, timeout=GIT_TIMEOUT_SECONDS)
+        return subprocess.run(["git", "-C", str(root), *args], capture_output=True, text=True,
+                              timeout=GIT_TIMEOUT_SECONDS, stdin=subprocess.DEVNULL, env=git_env())
     except (FileNotFoundError, PermissionError) as err:      # git is not installed, or not runnable
         return subprocess.CompletedProcess(args, 127, "", str(err))
+    except subprocess.TimeoutExpired:
+        # A blackholed network (captive portal, VPN down) makes fetch hang rather than fail. The
+        # update is optional, so this is a warning like any other fetch failure - never a dead search.
+        return subprocess.CompletedProcess(args, 124, "", f"git did not answer within {GIT_TIMEOUT_SECONDS:g}s")
 
 
 def update_skill(root: Path, report: Report, offline: bool = False) -> None:
@@ -131,7 +170,11 @@ def update_skill(root: Path, report: Report, offline: bool = False) -> None:
     if counts.returncode != 0:
         report.add("update", "warning", f"could not compare with {tracking} ({_first_line(counts.stderr)})")
         return
-    ahead, behind = (int(n) for n in counts.stdout.split())
+    pair = _two_counts(counts.stdout)
+    if pair is None:                                   # advice or a warning where two numbers belong
+        report.add("update", "warning", f"could not read how far this checkout is from {tracking}")
+        return
+    ahead, behind = pair
 
     if behind == 0:
         report.add("update", "ok", f"already the newest version on {tracking} ({_short_sha(root)})")
@@ -141,7 +184,13 @@ def update_skill(root: Path, report: Report, offline: bool = False) -> None:
                    f"{behind} newer commit(s) on {tracking}, but this checkout has {ahead} of its own; "
                    "not touching them - merge or rebase by hand")
         return
-    if git(["status", "--porcelain"], root).stdout.strip():
+    status = git(["status", "--porcelain"], root)
+    if status.returncode != 0:
+        # An index lock or a half-finished rebase looks exactly like a clean tree on stdout alone.
+        report.add("update", "warning", f"could not tell whether this checkout is clean ({_first_line(status.stderr)}); "
+                                        "left alone so nothing of yours is lost")
+        return
+    if status.stdout.strip():
         report.add("update", "warning",
                    f"{behind} newer commit(s) on {tracking}, but this checkout has uncommitted changes; "
                    "left alone so nothing of yours is lost")
@@ -162,6 +211,14 @@ def _short_sha(root: Path) -> str:
     return git(["rev-parse", "--short", "HEAD"], root).stdout.strip() or "unknown"
 
 
+def _two_counts(text: str) -> tuple[int, int] | None:
+    """The (ahead, behind) pair from `rev-list --left-right --count`, or None if that is not what came back."""
+    fields = (text or "").split()
+    if len(fields) != 2 or not all(f.lstrip("-").isdigit() for f in fields):
+        return None
+    return int(fields[0]), int(fields[1])
+
+
 def _first_line(text: str) -> str:
     return (text or "").strip().splitlines()[0][:160] if (text or "").strip() else "no detail"
 
@@ -178,28 +235,48 @@ def flush_stale_data(report_dir: Path, report: Report, max_age_hours: float, cro
         return
 
     now = time.time()
-    removed, freed = [], 0
-    for path in _expired(report_dir, REPORT_PATTERNS, now, max_age_hours * 3600, flush_all):
-        freed += path.stat().st_size
-        path.unlink()
-        removed.append(path.name)
+    removed, kept, freed = [], [], 0
+    stale = [(path, path.name) for path in _expired(report_dir, REPORT_PATTERNS, now, max_age_hours * 3600, flush_all)]
     crosscheck = report_dir / CROSSCHECK_DIR
-    if crosscheck.is_dir():
-        for path in _expired(crosscheck, ("*",), now, crosscheck_max_age_minutes * 60, flush_all):
-            freed += path.stat().st_size
+    if crosscheck.is_dir() and not crosscheck.is_symlink():
+        stale += [(path, f"{CROSSCHECK_DIR}/{path.name}")
+                  for path in _expired(crosscheck, CROSSCHECK_PATTERNS, now, crosscheck_max_age_minutes * 60, flush_all)]
+    for path, label in stale:
+        try:
+            size = path.stat().st_size
             path.unlink()
-            removed.append(f"{CROSSCHECK_DIR}/{path.name}")
+        except OSError as err:
+            # Another session deleted it first, or it is not ours to remove. A leftover file is worth
+            # a warning, never a refused search.
+            kept.append(f"{label} ({err.strerror or err})")
+            continue
+        freed += size
+        removed.append(label)
 
+    if kept:
+        report.add("flush", "warning",
+                   f"cleared {len(removed)} stale file(s) from {report_dir}, but could not remove "
+                   f"{len(kept)}: {_shorten(kept)}. A search still runs; delete them by hand if a stale "
+                   "report keeps turning up.", removed=len(removed), kept=len(kept), directory=str(report_dir))
+        return
     if not removed:
         report.add("flush", "ok", f"nothing stale in {report_dir}")
         return
-    shown = ", ".join(removed[:4]) + (f" and {len(removed) - 4} more" if len(removed) > 4 else "")
-    report.add("flush", "ok", f"cleared {len(removed)} stale file(s) ({freed // 1024} KB) from {report_dir}: {shown}",
+    report.add("flush", "ok",
+               f"cleared {len(removed)} stale file(s) ({freed // 1024} KB) from {report_dir}: {_shorten(removed)}",
                removed=len(removed), directory=str(report_dir))
+
+
+def _shorten(names: Sequence[str], keep: int = 4) -> str:
+    return ", ".join(names[:keep]) + (f" and {len(names) - keep} more" if len(names) > keep else "")
 
 
 def _expired(directory: Path, patterns: Sequence[str], now: float, max_age_seconds: float, flush_all: bool) -> list[Path]:
     """Files under `directory` (never below it, never elsewhere) older than the cutoff."""
+    if directory.is_symlink():
+        # Resolving a symlinked directory would move the "never elsewhere" fence with it, so the
+        # guard below would happily pass files in whatever it points at.
+        return []
     directory = directory.resolve()
     found: dict[Path, None] = {}
     for pattern in patterns:
@@ -254,39 +331,48 @@ def check_seats_aero(key: str, report: Report, timeout: float = 30.0) -> None:
         if "rejected the API key" in detail:
             report.fail("seats.aero", f"{detail} Nothing was searched.", 3)
         elif code == 429:
+            report.verified = True          # rate limiting is applied to a recognised account
             report.add("seats.aero", "warning",
                        "the key is accepted but seats.aero is rate-limiting this account right now "
                        "(HTTP 429). The daily quota may be spent; a search may fail or return cached data only.")
         elif code >= 500:
+            report.unverified = f"seats.aero returned {code}"
             report.add("seats.aero", "warning",
-                       f"the key is accepted but seats.aero returned {code}; it is having trouble, so a "
-                       "search may fail. Worth retrying in a few minutes.")
+                       f"seats.aero returned {code}, so the key could not be checked; it is having trouble, "
+                       "so a search may fail. Worth retrying in a few minutes.")
         else:
             report.fail("seats.aero", detail, 3)
         return
+    report.verified = True
     report.add("seats.aero", "ok",
                f"answered a live search for {PROBE_ROUTE[0]}-{PROBE_ROUTE[1]}; the key works "
                f"({client.calls_made} call spent of the ~1,000/day quota)")
 
 
-def note_connectors(report: Report) -> None:
-    """MCP connectors live in the session, not in this process; Claude checks them itself."""
-    report.add("connectors", "ok",
-               "this script cannot see MCP tools - before searching, confirm in-session whether the "
-               "FlightPoints tools answer; if they do not, run seats.aero-only and say so in the reply")
-
-
-def note_freshness(report: Report) -> None:
-    report.add("freshness", "ok",
-               "run the search without --no-refresh so seats.aero re-scrapes the matching records first; "
-               "only fall back to cached data when the user asks or the quota is nearly spent, and say which was used")
+def note_checks_this_script_cannot_make(report: Report) -> None:
+    """Two things no subprocess can settle. Status "note", not "ok": nothing here was verified."""
+    report.add("connectors", "note", "MCP tools are not visible from here: confirm in-session that the "
+                                     "FlightPoints tools answer before planning a cross-check (SKILL.md step 0)")
+    report.add("freshness", "note", "search without --no-refresh unless the user asked for cached data (SKILL.md step 0)")
 
 
 # --------------------------------------------------------------------------- entry point
 
 
 def run(args: argparse.Namespace) -> Report:
+    """Everything preflight does, on one Report. Never raises: a broken filesystem is a blocked step."""
     report = Report()
+    try:
+        _run_steps(args, report)
+    except OSError as err:
+        # A file this skill cannot read, write or delete: the user's to fix (exit 2), never exit 3,
+        # which SKILL.md defines as seats.aero refusing. Steps already taken stay in the report, so
+        # their warnings still reach the caller.
+        report.fail("preflight", f"preflight could not finish: {err}", 2)
+    return report
+
+
+def _run_steps(args: argparse.Namespace, report: Report) -> None:
     if args.update:
         update_skill(SKILL_ROOT, report, offline=args.offline)
     else:
@@ -299,19 +385,19 @@ def run(args: argparse.Namespace) -> Report:
 
     check_python(report)
     if report.exit_code:
-        return report
+        return
     key = check_api_key(report)
     if report.exit_code:
-        return report
+        return
     if args.offline:
-        report.add("seats.aero", "skipped", "--offline: the key was not checked against the API")
+        report.unverified = "--offline"
+        report.add("seats.aero", "skipped", "--offline: the key was not checked against the API, so nothing here "
+                                            "says it still works")
     else:
         check_seats_aero(key, report, timeout=args.timeout)
     if report.exit_code:
-        return report
-    note_connectors(report)
-    note_freshness(report)
-    return report
+        return
+    note_checks_this_script_cannot_make(report)
 
 
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
@@ -333,15 +419,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
 
 def main(argv: Sequence[str] | None = None) -> int:
     args = parse_args(argv)
-    try:
-        report = run(args)
-    except subprocess.TimeoutExpired:
-        print("error: git did not answer in time; re-run with --no-update to search on the version already here",
-              file=sys.stderr)
-        return 3
-    except OSError as err:
-        print(f"error: preflight could not finish: {err}", file=sys.stderr)
-        return 3
+    report = run(args)
     print(json.dumps(report.to_json(), indent=2) if args.json else report.to_text())
     return report.exit_code
 

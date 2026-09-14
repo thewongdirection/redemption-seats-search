@@ -1075,6 +1075,11 @@ def airline_url(code: str) -> str:
     return AIRLINE_URLS.get(code, "")
 
 
+# Every report this tool writes matches this glob; preflight clears stale ones by it, so the two
+# stay in step when the name below changes.
+REPORT_GLOB = "awards_*.html"
+
+
 def default_report_path(query: SearchQuery, report_dir: Path = DEFAULT_REPORT_DIR) -> Path:
     name = f"awards_{query.origin.replace(',', '+')}-{query.destination.replace(',', '+')}_{query.start_date.isoformat()}"
     if not query.single_day:
