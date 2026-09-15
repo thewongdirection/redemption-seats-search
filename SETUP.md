@@ -46,22 +46,54 @@ You can do both; the skill is the same.
 
 ### A1. Install the skill
 
+**Install it by cloning, not by copying.** Before every search the skill fast-forwards itself to the newest
+version its remote offers (Step 0, `scripts/preflight.py`), and it can only do that from a git checkout. The
+clone is the install; the link below just tells Claude Code where to find it.
+
 ```bash
 git clone https://github.com/thewongdirection/redemption-seats-search.git ~/redemption-seats-search
 mkdir -p ~/.claude/skills
 ln -s ~/redemption-seats-search ~/.claude/skills/redemption-seats-search
 ```
 
-This makes the skill available in every Claude Code session on your machine. To limit it to one project
-instead, copy the folder to that project's `.claude/skills/redemption-seats-search/`.
+This makes the skill available in every Claude Code session on your machine. Linking rather than copying is
+what keeps one checkout to update; the skill resolves the link before looking for git, so the symlink costs
+you nothing.
 
-On **Windows** there is no `ln -s`; either copy the folder into `%USERPROFILE%\.claude\skills\` or, from an
-administrator PowerShell, create a junction:
+To limit it to one project instead, clone it *into* that project rather than copying files in:
+
+```bash
+git clone https://github.com/thewongdirection/redemption-seats-search.git \
+  path/to/project/.claude/skills/redemption-seats-search
+```
+
+On **Windows** there is no `ln -s`. From an administrator PowerShell, create a junction:
 
 ```powershell
 git clone https://github.com/thewongdirection/redemption-seats-search.git $HOME\redemption-seats-search
 New-Item -ItemType Junction -Path "$HOME\.claude\skills\redemption-seats-search" -Target "$HOME\redemption-seats-search"
 ```
+
+If you cannot create a junction, copy the **whole** folder into `%USERPROFILE%\.claude\skills\`, including
+the hidden `.git` directory - without it the copy is not a checkout and will never update itself.
+
+#### What stops the skill updating itself
+
+Run `python3 scripts/preflight.py` and read its first line; it always says which case you are in.
+
+| First line says | Why | Fix |
+|---|---|---|
+| `updated: pulled N commit(s)…` or `ok: already the newest version` | Working as intended | Nothing to do |
+| `skipped: … is not a git checkout` | Installed from a zip, or copied without `.git` | Re-install with `git clone` |
+| `skipped: git is not installed` | No `git` on this machine | Install git, or update by re-cloning when you want the newest version |
+| `skipped: this skill sits inside <repo>, which is not its own checkout` | Files were copied into another repository, so it has no remote of its own | Clone it into place instead |
+| `skipped: this branch tracks no remote branch` | The checkout is on a local-only branch | `git branch -u origin/<branch>` |
+| `warning: … has uncommitted changes` | You edited the skill in place | Revert, stash, or fork and re-point `origin` |
+| `warning: … has N of its own` | You committed to the checkout | Merge or rebase by hand, or work in a fork |
+| `warning: could not reach <remote>` | Offline, or the branch it tracks no longer exists on the remote | Re-point with `git branch -u origin/<branch>` |
+
+It never overwrites your work and never blocks a search: anything other than the first row means you are
+searching on the version already on disk, which is usually fine but will not pick up fixes.
 
 ### A2. Give the script your key
 
@@ -122,6 +154,10 @@ Fork https://github.com/thewongdirection/redemption-seats-search on GitHub (or c
 private repository of your own; a private fork is fine and keeps your generated reports private if you ever
 commit them). Connect that repository to Claude Code on the web through the GitHub integration if you have
 not already. Web sessions can only work inside repositories you have connected, so the skill has to live in one.
+
+A web session checks out your repository, so the skill is a git checkout there and updates itself from *your*
+fork - it will not pull this repository's changes. To take them, sync your fork on GitHub ("Sync fork" on the
+repository page, or `git pull upstream <branch>` locally) and the next session picks them up.
 
 ### B3. Start a session
 
@@ -221,6 +257,7 @@ one day, use `--no-refresh` for the exploratory ones and refresh only the search
 | Every row is 200+ days old for one program | seats.aero has that program's scraping paused (the notes will say "scraping paused"). Nothing on your side fixes it; check the program's site. |
 | "No records" for a date well inside 11 months | No tracked program has award space that day in any cabin. Try `--flex 3`, the other airport in the city, or `--pax 1`. |
 | Claude does not use the skill | Path A: confirm `~/.claude/skills/redemption-seats-search/SKILL.md` exists. Path B: confirm you are in a session on the repository that contains `SKILL.md` and `CLAUDE.md`. |
+| The skill never updates itself | It was installed by copying rather than cloning, or you have local edits. Run `python3 scripts/preflight.py` and match its first line against the table in A1. |
 | Rows marked stale | The refresh could not update them; the notes say why. A "scraping paused" note means seats.aero cannot refresh that program right now. |
 
 ## Security notes
